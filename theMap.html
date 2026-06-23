@@ -34,13 +34,12 @@
 
 #viewScaler {
   position: absolute;
-  top: 0; left: 0;
-  width: 540px;
-  height: 960px;
-  transform: scale(4);
-  transform-origin: top left;
+  inset: 0;
 }
-#viewDiv { width: 540px; height: 960px; }
+#viewDiv {
+  position: absolute;
+  inset: 0;
+}
 
     /* Hide the default ArcGIS UI we don't want on a kiosk. We keep zoom only. */
     .esri-ui-corner .esri-component.esri-attribution { display: none !important; }
@@ -59,8 +58,8 @@
 }
 #titleLogo {
   flex: 0 0 auto;
-  width: 300px;
-  height: 300px;
+  width: 150px;
+  height: 150px;
   filter: drop-shadow(0 0 6px rgba(255,255,255,0.95))
           drop-shadow(0 2px 4px rgba(0,0,0,0.25));
 }
@@ -71,7 +70,7 @@
   line-height: 1.0;
 }
 #titleText .line1 {
-  font-size: 85px;
+  font-size: 42px;
   font-weight: 800;
   color: #1d1d1b;
   letter-spacing: -0.5px;
@@ -81,7 +80,7 @@
      0    0   8px rgba(255,255,255,0.9);
 }
 #titleText .line2 {
-  font-size: 100px;
+  font-size: 50px;
   font-weight: 800;
   color: #1d1d1b;
   letter-spacing: -1px;
@@ -94,9 +93,9 @@
     /* ============================== LEGEND (PNG placeholder) ============================== */
     #legendBox {
       position: absolute;
-      left: 28px;
-      bottom: 28px;
-      width: 400px;
+      left: 14px;
+      bottom: 14px;
+      width: 200px;
       background: rgba(255,255,255,0.96);
       border: 1px solid #b9b9b9;
       border-radius: 10px;
@@ -129,12 +128,12 @@
     /* ============================== BUTTON PANEL (right side) ============================== */
     #buttonPanel {
       position: absolute;
-      top: 2170px;
-      right: 28px;
-      width: 620px;
+      top: 1085px;
+      right: 14px;
+      width: 310px;
       display: flex;
       flex-direction: column;
-      gap: 25px;
+      gap: 15px;
       z-index: 25;
     }
 
@@ -163,12 +162,12 @@
       filter: brightness(1.12);
     }
     .kioskBtn .btnTitle {
-      font-size: 55px;
+      font-size: 27px;
       font-weight: 700;
       letter-spacing: 0.2px;
     }
     .kioskBtn .btnSub {
-      font-size: 32px;
+      font-size: 16px;
       font-weight: 400;
       opacity: 0.85;
     }
@@ -180,7 +179,7 @@
       right: 18px;
       top: 50%;
       transform: translateY(-50%);
-      font-size: 50px;
+      font-size: 25px;
       opacity: 0.55;
     }
 
@@ -3857,7 +3856,6 @@
   });
     function setBusy(on) { busyEl.classList.toggle("show", !!on); }
 
-const SCALE = 4;
 
 function installPointerCorrection(view) {
   const scaler = document.getElementById("viewScaler");
@@ -3947,8 +3945,7 @@ function installPointerCorrection(view) {
     });
     window.view = window;
     view.when(function () {
-      installPointerCorrection(view);
-      initialViewpoint = view.viewpoint.clone(); 
+
       
 
       locateLayers().then(function () {
