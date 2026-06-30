@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Kiosk</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000;
+    touch-action: none;            /* kills pan / pinch-zoom gestures */
+    -ms-touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;   /* no long-press context menu */
+    overscroll-behavior: none;     /* no pull-to-refresh / bounce */
+  }
+  iframe { border: 0; width: 100vw; height: 100vh; display: block; touch-action: none; }
+</style>
+</head>
+<body>
+  <iframe id="exp" src="" allow="fullscreen; geolocation"></iframe>
+
+  <script>
+    // ===================== CONFIG =====================
+    const EXPERIENCE_URL = "https://experience.arcgis.com/experience/e800db567b7a4774b8db75768a5b5052/";
+    const IDLE_MS = 25000;   // 25 seconds
+    // ==================================================
+
+    const frame = document.getElementById("exp");
+
+    function loadFresh() {
+      const sep = EXPERIENCE_URL.includes("?") ? "&" : "?";
+      frame.src = EXPERIENCE_URL + sep + "_kr=" + Date.now();
+    }
+
+    let idleTimer;
+    function resetIdle() {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(loadFresh, IDLE_MS);
+    }
+    ["mousemove","mousedown","keydown","touchstart","touchmove","wheel","scroll","pointerdown"]
+      .forEach(evt => window.addEventListener(evt, resetIdle, { passive: true }));
+    window.addEventListener("blur", () => { if (document.activeElement === frame) resetIdle(); });
+
+    window.addEventListener("wheel", (e) => { if (e.ctrlKey) e.preventDefault(); }, { passive: false });
+    window.addEventListener("keydown", (e) => {
+      if (e.ctrlKey && ["+","-","=","0"].includes(e.key)) e.preventDefault();
+    }, { passive: false });
+    ["gesturestart","gesturechange","gestureend"].forEach(evt =>
+      document.addEventListener(evt, (e) => e.preventDefault()));
+    let lastTouch = 0;
+    document.addEventListener("touchend", (e) => {
+      const now = Date.now();
+      if (now - lastTouch <= 300) e.preventDefault();
+      lastTouch = now;
+    }, { passive: false });
+
+    // ---- Boot ----
+    loadFresh();
+    resetIdle();
+  </script>
+</body>
+</html>
