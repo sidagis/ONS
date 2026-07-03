@@ -1,6 +1,6 @@
 @echo off
-set "URL=https://raw.githubusercontent.com/sidagis/ONS/refs/heads/main/theMap.html"
-set "DEST=C:\theMap.html"
+set URL="https://raw.githubusercontent.com/sidagis/ONS/refs/heads/main/theMap.html"
+set DEST="C:\theMap.html"
 
 curl -L -o "%DEST%" "%URL%"
 
