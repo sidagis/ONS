@@ -29,7 +29,7 @@ CoordMode "Pixel", "Screen"
 CoordMode "Mouse", "Screen"
 
 global INI := A_ScriptDir "\kiosk.ini"
-global LOG := A_ScriptDir "\kiosk-log.txt"
+global LOGFILE := A_ScriptDir "\kiosk-log.txt"
 global CFG := LoadConfig()
 global exiting := false
 
@@ -236,7 +236,7 @@ IdleMs() {
 ;  The main loop
 ; =====================================================================
 IdleWatch() {
-    global CFG, exiting, mediaLastSeen, mediaWhy, lastRealInput, warmSent
+    global CFG, exiting, mediaLastSeen, mediaWhy, lastRealInput, warmSent, USES_WRAPPER
     static fired := false
 
     if (exiting)
@@ -540,9 +540,11 @@ KeepAwake() {
                         . ' & powercfg /change hibernate-timeout-ac 0', , "Hide"
 }
 
+; Named LOGFILE, not LOG: variables and functions share one namespace in
+; AutoHotkey v2, and Log() is the built-in natural logarithm.
 LogLine(text) {
-    global LOG
-    try FileAppend FormatTime(, "yyyy-MM-dd HH:mm:ss") "  " text "`n", LOG, "UTF-8-RAW"
+    global LOGFILE
+    try FileAppend FormatTime(, "yyyy-MM-dd HH:mm:ss") "  " text "`n", LOGFILE, "UTF-8-RAW"
 }
 
 ; =====================================================================
