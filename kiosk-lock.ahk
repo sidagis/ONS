@@ -5,24 +5,44 @@
 ; =====================================================================
 ;  kiosk-lock.ahk   -   ArcGIS Experience Builder touch kiosk controller
 ;
-;  Everything is configured in kiosk.ini, which sits next to this file.
-;  This script:
+;  Configured entirely in kiosk.ini, which sits next to this file.
+;
+;  What it does:
 ;    * reads kiosk.ini and generates kiosk-config.js for the wrapper
 ;    * finds Microsoft Edge on its own
 ;    * launches Edge in kiosk mode and relaunches it if it dies
 ;    * resets the app after N seconds with no touch / mouse / key input
+;    * holds that reset back while a video is playing (Edge audio, and
+;      optionally motion inside a marked screen rectangle)
+;    * mutes the Windows playback device, while keeping the audio signal
+;      it depends on alive
+;    * resets instantly by swapping to a pre-loaded copy of the app,
+;      falling back to a plain reload if that is not available
 ;    * swallows every keystroke except Alt+F4
 ;
-;  Start it from the "Start Kiosk" shortcut, or run it directly with
-;  AutoHotkey64.exe. It needs no administrator rights.
+;  Needs no administrator rights.
 ; =====================================================================
 
 Persistent
 ProcessSetPriority "High"
+CoordMode "Pixel", "Screen"
+CoordMode "Mouse", "Screen"
 
 global INI := A_ScriptDir "\kiosk.ini"
+global LOG := A_ScriptDir "\kiosk-log.txt"
 global CFG := LoadConfig()
 global exiting := false
+
+global mediaLastSeen := 0          ; tick count when a video was last detected
+global mediaWhy := ""              ; which detector saw it
+global lastResetHow := "-"         ; diagnostics
+
+; The kiosk injects mouse clicks and keystrokes of its own, and Windows
+; counts those as user input. So idle time is tracked here rather than
+; read straight from A_TimeIdle - see UpdateIdle().
+global lastRealInput := A_TickCount
+global suppressUntil := 0
+global warmSent := false
 
 global EDGE_EXE := FindEdge()
 if (EDGE_EXE = "") {
@@ -36,11 +56,14 @@ if (CFG["AppUrl"] = "" || InStr(CFG["AppUrl"], "REPLACE_ME")) {
     ExitApp
 }
 
+global USES_WRAPPER := (CFG["StartUrl"] = "") && FileExist(A_ScriptDir "\kiosk-wrapper.html")
 global START_URL := BuildStartUrl()
 global EDGE_ARGS := BuildEdgeArgs()
 
 ; --------------------------- start up --------------------------------
 KeepAwake()
+if (CFG["MuteOutput"])
+    MuteOutput()
 KillStaleEdge()
 if (CFG["ClearProfileOnStart"])
     try DirDelete CFG["UserDataDir"], true
@@ -52,16 +75,12 @@ if (CFG["BlockAllKeys"])
 SetTimer IdleWatch, 1000
 SetTimer EdgeWatch, 3000
 
-A_TrayMenu.Delete()
-A_TrayMenu.Add("Reset app now", (*) => ResetApp())
-A_TrayMenu.Add("Edit kiosk.ini", (*) => Run('notepad.exe "' INI '"'))
-A_TrayMenu.Add()
-A_TrayMenu.Add("Exit kiosk", (*) => ExitKiosk())
-TraySetIcon "shell32.dll", 14
-A_IconTip := "Kiosk - reset after " CFG["IdleSeconds"] "s idle - Alt+F4 to exit"
+BuildTrayMenu()
 return
 
-; --------------------------- config ----------------------------------
+; =====================================================================
+;  Configuration
+; =====================================================================
 LoadConfig() {
     global INI
     c := Map()
@@ -71,15 +90,30 @@ LoadConfig() {
     c["UserDataDir"]         := Trim(IniRead(INI, "Kiosk", "UserDataDir", "C:\KioskProfile"))
     c["IdleSeconds"]         := NumOr(IniRead(INI, "Kiosk", "IdleSeconds", 25), 25)
     c["LoadTimeoutSeconds"]  := NumOr(IniRead(INI, "Kiosk", "LoadTimeoutSeconds", 25), 25)
-    c["RevealDelayMs"]       := NumOr(IniRead(INI, "Kiosk", "RevealDelayMs", 1400), 1400)
+    c["RevealDelayMs"]       := NumOr(IniRead(INI, "Kiosk", "RevealDelayMs", 250), 250)
     c["BlockAllKeys"]        := NumOr(IniRead(INI, "Kiosk", "BlockAllKeys", 1), 1)
     c["BlockMouseButtons"]   := NumOr(IniRead(INI, "Kiosk", "BlockMouseButtons", 1), 1)
     c["BlockWheel"]          := NumOr(IniRead(INI, "Kiosk", "BlockWheel", 0), 0)
     c["ExitToDesktop"]       := NumOr(IniRead(INI, "Kiosk", "ExitToDesktop", 1), 1)
     c["ClearProfileOnStart"] := NumOr(IniRead(INI, "Kiosk", "ClearProfileOnStart", 0), 0)
 
-    if (c["IdleSeconds"] < 5)          ; guard against a typo bricking the kiosk
+    c["HoldForAudio"]        := NumOr(IniRead(INI, "Kiosk", "HoldForAudio", 1), 1)
+    c["MuteOutput"]          := NumOr(IniRead(INI, "Kiosk", "MuteOutput", 1), 1)
+    c["VideoRect"]           := Trim(IniRead(INI, "Kiosk", "VideoRect", ""))
+    c["MaxHoldSeconds"]      := NumOr(IniRead(INI, "Kiosk", "MaxHoldSeconds", 180), 180)
+    c["PostVideoSeconds"]    := NumOr(IniRead(INI, "Kiosk", "PostVideoSeconds", 20), 20)
+
+    c["FastReset"]           := NumOr(IniRead(INI, "Kiosk", "FastReset", 1), 1)
+    c["PrewarmSeconds"]      := NumOr(IniRead(INI, "Kiosk", "PrewarmSeconds", 12), 12)
+
+    if (c["IdleSeconds"] < 5)                          ; a typo must not brick the kiosk
         c["IdleSeconds"] := 5
+    if (c["MaxHoldSeconds"] < c["IdleSeconds"] + 10)    ; a hold shorter than the timeout is meaningless
+        c["MaxHoldSeconds"] := c["IdleSeconds"] + 10
+    if (c["PrewarmSeconds"] > c["IdleSeconds"] - 3)     ; must leave time to actually load
+        c["PrewarmSeconds"] := Max(3, c["IdleSeconds"] - 3)
+
+    c["Rect"] := ParseRect(c["VideoRect"])
     return c
 }
 
@@ -87,6 +121,21 @@ NumOr(value, fallback) {
     if IsNumber(Trim(value))
         return Integer(Trim(value))
     return fallback
+}
+
+ParseRect(s) {
+    parts := StrSplit(Trim(s), ",")
+    if (parts.Length != 4)
+        return ""
+    r := []
+    for p in parts {
+        if !IsNumber(Trim(p))
+            return ""
+        r.Push(Integer(Trim(p)))
+    }
+    if (r[3] <= r[1] || r[4] <= r[2])
+        return ""
+    return r
 }
 
 FindEdge() {
@@ -110,19 +159,17 @@ FindEdge() {
 }
 
 BuildStartUrl() {
-    global CFG
+    global CFG, USES_WRAPPER
     if (CFG["StartUrl"] != "")
         return CFG["StartUrl"]
-
-    wrapper := A_ScriptDir "\kiosk-wrapper.html"
-    if FileExist(wrapper) {
+    if (USES_WRAPPER) {
         WriteWrapperConfig()
-        return "file:///" StrReplace(wrapper, "\", "/")
+        return "file:///" StrReplace(A_ScriptDir "\kiosk-wrapper.html", "\", "/")
     }
-    return CFG["AppUrl"]          ; no wrapper present - load the app directly
+    return CFG["AppUrl"]
 }
 
-; The wrapper reads this file, so kiosk.ini stays the single source of truth.
+; The wrapper reads this, so kiosk.ini stays the single source of truth.
 WriteWrapperConfig() {
     global CFG
     f := A_ScriptDir "\kiosk-config.js"
@@ -132,6 +179,7 @@ WriteWrapperConfig() {
         . "  idleSeconds: "        CFG["IdleSeconds"] ",`n"
         . "  loadTimeoutSeconds: " CFG["LoadTimeoutSeconds"] ",`n"
         . "  revealDelayMs: "      CFG["RevealDelayMs"] ",`n"
+        . "  fastReset: "          (CFG["FastReset"] ? "true" : "false") ",`n"
         . "  retrySeconds: 10`n"
         . "};`n"
     try FileDelete f
@@ -152,33 +200,261 @@ BuildEdgeArgs() {
         . ' --disable-features=TranslateUI,EdgeShoppingAssistant,msEdgeSidebar,EdgeSplitScreen,msWebOOUI'
         . ' --disable-pinch --overscroll-history-navigation=0'
         . ' --disable-backgrounding-occluded-windows'
+        . ' --disable-background-timer-throttling --disable-renderer-backgrounding'
         . ' --autoplay-policy=no-user-gesture-required'
         . ' --check-for-update-interval=31536000'
         . ' --start-fullscreen'
 }
 
-; --------------------------- idle reset ------------------------------
-; A_TimeIdle is driven by GetLastInputInfo, which touch input updates.
-; A_TimeIdlePhysical is deliberately NOT used: Windows can flag touch as
-; injected input, which would make the app reset under someone's finger.
+; =====================================================================
+;  Idle tracking
+; =====================================================================
+; Our own injected clicks and keystrokes update the Windows "last input"
+; time, which would keep pushing the reset out of reach. So the real
+; idle clock is kept here, and updates from A_TimeIdle are ignored for a
+; moment after we inject anything. If a visitor really does touch the
+; screen during that window, the next tick still picks it up, because
+; A_TimeIdle keeps counting from their touch.
+UpdateIdle() {
+    global lastRealInput, suppressUntil
+    t := A_TickCount - A_TimeIdle
+    if (t > lastRealInput && A_TickCount > suppressUntil)
+        lastRealInput := t
+}
+
+Injecting(ms := 1500) {
+    global suppressUntil
+    suppressUntil := A_TickCount + ms
+}
+
+IdleMs() {
+    global lastRealInput
+    return A_TickCount - lastRealInput
+}
+
+; =====================================================================
+;  The main loop
+; =====================================================================
 IdleWatch() {
-    global CFG, exiting
+    global CFG, exiting, mediaLastSeen, mediaWhy, lastRealInput, warmSent
     static fired := false
 
     if (exiting)
         return
 
-    if (A_TimeIdle >= CFG["IdleSeconds"] * 1000) {
-        if (!fired) {
-            fired := true
-            ResetApp()
-        }
-    } else {
+    UpdateIdle()
+
+    ; Sample the detectors every tick, not only once idle - the motion
+    ; detector needs two consecutive samples before it can say anything.
+    why := DetectVideo()
+    if (why != "") {
+        mediaLastSeen := A_TickCount
+        mediaWhy := why
+    }
+
+    idle := IdleMs()
+
+    if (idle < CFG["IdleSeconds"] * 1000) {
         fired := false
+
+        ; Start loading the standby copy shortly before the reset is due,
+        ; so the swap is instant when it happens.
+        if (CFG["FastReset"] && USES_WRAPPER && !warmSent
+            && idle >= (CFG["IdleSeconds"] - CFG["PrewarmSeconds"]) * 1000) {
+            warmSent := true
+            TapZone("warm")
+        }
+        return
+    }
+
+    ; Idle threshold passed. Hold the reset back if a video was seen
+    ; recently, unless we have been holding past the ceiling.
+    if (mediaLastSeen
+        && (A_TickCount - mediaLastSeen) < CFG["PostVideoSeconds"] * 1000
+        && idle < CFG["MaxHoldSeconds"] * 1000)
+        return
+
+    if (!fired) {
+        fired := true
+        mediaLastSeen := 0
+        mediaWhy := ""
+        ResetApp()
+        lastRealInput := A_TickCount     ; the idle clock restarts now
+        warmSent := false
     }
 }
 
+; Returns the name of whichever detector saw a video, or "".
+DetectVideo() {
+    global CFG
+    if (CFG["HoldForAudio"] && EdgeAudioActive())
+        return "Edge audio"
+    if (CFG["Rect"] != "" && RegionChanged(CFG["Rect"]))
+        return "screen motion"
+    return ""
+}
+
+; =====================================================================
+;  Video detection
+; =====================================================================
+; --- Edge is feeding audio to Windows --------------------------------
+; Walks the audio sessions on the default playback device and looks for
+; an active one owned by msedge.exe. A muted OUTPUT does not affect
+; this: Edge still produces the stream, Windows just discards it. A
+; video muted inside the player is a different matter - then Edge
+; produces nothing and this detector goes quiet.
+EdgeAudioActive() {
+    static broken := false
+    if (broken)
+        return false
+
+    try {
+        ; MMDeviceEnumerator -> default render endpoint
+        enum := ComObject("{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+                        , "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+        ComCall(4, enum, "int", 0, "int", 1, "ptr*", &devPtr := 0)   ; GetDefaultAudioEndpoint(eRender, eMultimedia)
+        dev := ComValue(13, devPtr)
+
+        ; IMMDevice::Activate(IAudioSessionManager2)
+        iid := Buffer(16, 0)
+        DllCall("ole32\CLSIDFromString", "wstr", "{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}", "ptr", iid)
+        ComCall(3, dev, "ptr", iid, "uint", 0, "ptr", 0, "ptr*", &mgrPtr := 0)
+        mgr := ComValue(13, mgrPtr)
+
+        ComCall(5, mgr, "ptr*", &sePtr := 0)                          ; GetSessionEnumerator
+        se := ComValue(13, sePtr)
+        ComCall(3, se, "int*", &count := 0)                           ; GetCount
+
+        Loop count {
+            ComCall(4, se, "int", A_Index - 1, "ptr*", &scPtr := 0)   ; GetSession
+            sc := ComValue(13, scPtr)
+
+            state := -1
+            ComCall(3, sc, "int*", &state)                            ; GetState: 0 inactive, 1 active, 2 expired
+            if (state != 1)
+                continue
+
+            ; An active session is enough on a kiosk, but confirm the
+            ; owner when we can, so a system sound cannot hold the reset.
+            owner := ""
+            try {
+                sc2 := ComObjQuery(sc, "{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}")
+                ComCall(14, sc2, "uint*", &pid := 0)                  ; IAudioSessionControl2::GetProcessId
+                owner := ProcessGetName(pid)
+            }
+            if (owner = "" || owner = "msedge.exe")
+                return true
+        }
+    } catch as e {
+        broken := true
+        LogLine("audio detection unavailable, switching it off: " e.Message)
+    }
+    return false
+}
+
+; --- Pixels in the video area keep changing --------------------------
+; The backstop for a video muted in the player. Samples a 4x4 grid
+; inside the marked rectangle and compares against the previous second.
+RegionChanged(r) {
+    static prev := ""
+    sig := ""
+    Loop 4 {
+        ix := A_Index
+        Loop 4 {
+            iy := A_Index
+            x := Round(r[1] + (r[3] - r[1]) * (ix - 0.5) / 4)
+            y := Round(r[2] + (r[4] - r[2]) * (iy - 0.5) / 4)
+            try sig .= PixelGetColor(x, y) "|"
+        }
+    }
+    changed := (prev != "" && sig != "" && sig != prev)
+    prev := sig
+    return changed
+}
+
+; =====================================================================
+;  Audio output mute
+; =====================================================================
+; Mutes the default playback device. Deliberately mutes the DEVICE, not
+; the video, so EdgeAudioActive() keeps working.
+MuteOutput() {
+    try {
+        enum := ComObject("{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+                        , "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+        ComCall(4, enum, "int", 0, "int", 1, "ptr*", &devPtr := 0)
+        dev := ComValue(13, devPtr)
+
+        iid := Buffer(16, 0)
+        DllCall("ole32\CLSIDFromString", "wstr", "{5CDF2C82-841E-4546-9722-0CF74078229A}", "ptr", iid)   ; IAudioEndpointVolume
+        ComCall(3, dev, "ptr", iid, "uint", 0, "ptr", 0, "ptr*", &volPtr := 0)
+        vol := ComValue(13, volPtr)
+
+        ComCall(14, vol, "int", 1, "ptr", 0)      ; SetMute(TRUE, NULL)
+        LogLine("playback device muted")
+        return true
+    } catch as e {
+        LogLine("could not mute the playback device: " e.Message)
+        return false
+    }
+}
+
+OutputIsMuted() {
+    try {
+        enum := ComObject("{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+                        , "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+        ComCall(4, enum, "int", 0, "int", 1, "ptr*", &devPtr := 0)
+        dev := ComValue(13, devPtr)
+        iid := Buffer(16, 0)
+        DllCall("ole32\CLSIDFromString", "wstr", "{5CDF2C82-841E-4546-9722-0CF74078229A}", "ptr", iid)
+        ComCall(3, dev, "ptr", iid, "uint", 0, "ptr", 0, "ptr*", &volPtr := 0)
+        vol := ComValue(13, volPtr)
+        ComCall(15, vol, "int*", &muted := 0)     ; GetMute
+        return muted ? "muted" : "NOT muted"
+    }
+    return "unknown"
+}
+
+; =====================================================================
+;  Reset
+; =====================================================================
+; Fast path: the wrapper keeps a second, already-loaded copy of the app
+; behind the visible one. Tapping a small zone in the top-left corner
+; makes it swap, which is instant and shows no loading screen.
+;
+; The tap has to be a mouse click, because that is the one kind of input
+; the wrapper can tell apart from a visitor's finger - so a stray touch
+; in the corner cannot trigger a reset.
+;
+; The wrapper puts a token in its title, which is the Edge window title.
+; If the token does not change, the swap did not happen and we fall back
+; to a plain reload. So if any part of this fails, the kiosk still
+; resets correctly, just with the loading screen.
 ResetApp() {
+    global CFG, USES_WRAPPER, lastResetHow
+
+    if (CFG["FastReset"] && USES_WRAPPER) {
+        before := ResetToken()
+        if (before != "") {
+            TapZone("reset", false)                  ; try without moving the cursor
+            Sleep 350
+            if (ResetToken() != before) {
+                lastResetHow := "swap (no cursor)"
+                return
+            }
+            TapZone("reset", true)                   ; real click
+            Sleep 450
+            if (ResetToken() != before) {
+                lastResetHow := "swap"
+                return
+            }
+        }
+    }
+
+    HardReload()
+}
+
+HardReload() {
+    global lastResetHow
     hwnd := WinExist("ahk_exe msedge.exe")
     if (!hwnd)
         return
@@ -186,10 +462,53 @@ ResetApp() {
         WinActivate hwnd
         WinWaitActive hwnd, , 2
     }
-    SendInput "{F5}"      ; reloads the wrapper, so the app returns to its home state
+    Injecting()
+    SendInput "{F5}"
+    lastResetHow := "reload"
 }
 
-; --------------------------- watchdog --------------------------------
+; Reads the token the wrapper publishes in its title, e.g. "Kiosk|r7f3a-2".
+ResetToken() {
+    try {
+        if (hwnd := WinExist("ahk_exe msedge.exe")) {
+            t := WinGetTitle(hwnd)
+            if RegExMatch(t, "\|r([^|]+)", &m)
+                return m[1]
+        }
+    }
+    return ""
+}
+
+; which = "reset" (top-left) or "warm" (top-right)
+TapZone(which, realClick := true) {
+    hwnd := WinExist("ahk_exe msedge.exe")
+    if (!hwnd)
+        return
+    try {
+        WinActivate hwnd
+        WinGetPos &wx, &wy, &ww, &wh, hwnd
+    } catch
+        return
+
+    cx := (which = "reset") ? 4 : ww - 5          ; client coordinates
+    cy := 4
+
+    Injecting()
+    if (!realClick) {
+        ; Posted message: no cursor movement, no visible pointer. Chromium
+        ; does not always honour these, hence the verification upstairs.
+        try ControlClick "X" cx " Y" cy, hwnd, , "Left", 1, "NA"
+        return
+    }
+
+    MouseGetPos &ox, &oy
+    try Click(wx + cx, wy + cy)
+    try MouseMove ox, oy, 0
+}
+
+; =====================================================================
+;  Watchdog and housekeeping
+; =====================================================================
 EdgeWatch() {
     global exiting
     if (exiting)
@@ -213,16 +532,89 @@ KillStaleEdge() {
 }
 
 KeepAwake() {
-    ; No monitor blank, no sleep, no disk spindown while on AC.
-    ; Silently does nothing if the script is not elevated - the installer
-    ; already applied these once with admin rights.
+    ; Silently does nothing if not elevated - the installer already
+    ; applied these once with admin rights.
     try RunWait A_ComSpec ' /c powercfg /change monitor-timeout-ac 0'
                         . ' & powercfg /change standby-timeout-ac 0'
                         . ' & powercfg /change disk-timeout-ac 0'
                         . ' & powercfg /change hibernate-timeout-ac 0', , "Hide"
 }
 
-; --------------------------- key lockdown ----------------------------
+LogLine(text) {
+    global LOG
+    try FileAppend FormatTime(, "yyyy-MM-dd HH:mm:ss") "  " text "`n", LOG, "UTF-8-RAW"
+}
+
+; =====================================================================
+;  Tray menu (setup and diagnostics)
+;  Reachable only while BlockMouseButtons=0 in kiosk.ini, and invisible
+;  in full kiosk mode because there is no taskbar.
+; =====================================================================
+BuildTrayMenu() {
+    global CFG, INI
+    m := A_TrayMenu
+    m.Delete()
+    m.Add("Status", (*) => ShowStatus())
+    m.Add("Mark video area", (*) => MarkVideoArea())
+    m.Add()
+    m.Add("Reset app now", (*) => ResetApp())
+    m.Add("Mute output again", (*) => MuteOutput())
+    m.Add("Edit kiosk.ini", (*) => Run('notepad.exe "' INI '"'))
+    m.Add()
+    m.Add("Exit kiosk", (*) => ExitKiosk())
+    TraySetIcon "shell32.dll", 14
+    A_IconTip := "Kiosk - resets after " CFG["IdleSeconds"] "s idle - Alt+F4 to exit"
+}
+
+ShowStatus() {
+    global CFG, mediaLastSeen, mediaWhy, lastResetHow, USES_WRAPPER
+    live := DetectVideo()
+    ago := mediaLastSeen ? Round((A_TickCount - mediaLastSeen) / 1000) " s ago" : "never"
+    tok := ResetToken()
+    MsgBox ""
+        . "VIDEO`n"
+        . "  right now:      " (live = "" ? "nothing detected" : "detected by " live) "`n"
+        . "  last detected:  " ago (mediaWhy != "" ? " (" mediaWhy ")" : "") "`n"
+        . "  Edge audio:     " (CFG["HoldForAudio"] ? (EdgeAudioActive() ? "PLAYING" : "quiet") : "off") "`n"
+        . "  screen motion:  " (CFG["Rect"] != "" ? "watching " CFG["VideoRect"] : "off, no VideoRect set") "`n"
+        . "  output device:  " OutputIsMuted() "`n`n"
+        . "IDLE`n"
+        . "  now:            " Round(IdleMs() / 1000) " s of " CFG["IdleSeconds"] " s`n"
+        . "  hold ceiling:   " CFG["MaxHoldSeconds"] " s`n`n"
+        . "RESET`n"
+        . "  fast reset:     " (CFG["FastReset"] && USES_WRAPPER ? "on" : "off") "`n"
+        . "  wrapper token:  " (tok != "" ? tok : "not visible - fast reset will fall back to reload") "`n"
+        . "  last reset via: " lastResetHow
+        , "Kiosk status", 0x40
+}
+
+MarkVideoArea() {
+    global INI, CFG
+    ToolTip "Tap or click the TOP-LEFT corner of the video."
+    KeyWait "LButton", "D"
+    MouseGetPos &x1, &y1
+    KeyWait "LButton"
+
+    ToolTip "Now tap the BOTTOM-RIGHT corner of the video."
+    KeyWait "LButton", "D"
+    MouseGetPos &x2, &y2
+    KeyWait "LButton"
+    ToolTip
+
+    if (Abs(x2 - x1) < 40 || Abs(y2 - y1) < 40) {
+        MsgBox "That area is too small - nothing was saved.`n`nTry again and tap opposite corners of the video.", "Kiosk", 0x30
+        return
+    }
+    rect := Min(x1, x2) "," Min(y1, y2) "," Max(x1, x2) "," Max(y1, y2)
+    try IniWrite rect, INI, "Kiosk", "VideoRect"
+    CFG["VideoRect"] := rect
+    CFG["Rect"] := ParseRect(rect)
+    MsgBox "Video area saved: " rect "`n`nIt is active straight away. Start the video, leave the screen alone, and check Status to confirm it is detected.", "Kiosk", 0x40
+}
+
+; =====================================================================
+;  Key lockdown
+; =====================================================================
 InstallKeyBlocks() {
     ; Everything is swallowed except the Alt modifiers and F4 itself, so
     ; Alt+F4 can still be assembled. Alt alone does nothing once every
@@ -269,7 +661,9 @@ F4::return
     *WheelRight::return
 #HotIf
 
-; --------------------------- clean exit ------------------------------
+; =====================================================================
+;  Clean exit
+; =====================================================================
 ExitKiosk() {
     global exiting, CFG
     exiting := true

@@ -306,7 +306,9 @@ function Invoke-Lockdown {
     # kiosk cannot browse anywhere else and the app still works.
     $ini = Join-Path $Dir 'kiosk.ini'
     $url = Get-IniValue $ini 'AppUrl'
-    $hosts = @('file:///' + $Dir.Replace('\','/').TrimEnd('/') + '/', '[*.]arcgis.com', '[*.]arcgisonline.com', '[*.]arcgis.net')
+    $hosts = @('file:///' + $Dir.Replace('\','/').TrimEnd('/') + '/',
+               '[*.]arcgis.com', '[*.]arcgisonline.com', '[*.]arcgis.net',
+               '[*.]vimeo.com', '[*.]vimeocdn.com')
     if ($url -and $url -match '^https?://([^/:]+)') {
         $h = $Matches[1]
         $parts = $h.Split('.')

@@ -59,6 +59,23 @@ Your admin account keeps a normal desktop — the shell setting is per-user.
 
 25 seconds is short — someone reading a popup without touching anything gets reset out from under them. If you see that happen in the field, try 45.
 
+## Videos in the app
+
+The kiosk won't reset while a video is playing. Two signals feed that, either is enough:
+
+1. **Edge is producing audio.** No changes to your published app, so it still behaves normally on mobile. **Mute the output device, not the player** — a muted device still leaves Edge producing the stream, which is what the detector sees. `MuteOutput=1` makes the kiosk mute the device itself at every start.
+2. **Pixels in the video area keep changing.** The backstop for a visitor muting the player by hand. Tray icon → **Mark video area**, tap two opposite corners.
+
+`MaxHoldSeconds` (default 180) caps the hold, measured from the last real touch, so a stuck detector can't park the kiosk forever. `PostVideoSeconds` is the pause between the video ending and the reset.
+
+Check it with the tray icon → **Status** before the stand goes public. The tray menu needs `BlockMouseButtons=0` in `kiosk.ini` while you're setting up.
+
+## Instant resets
+
+With `FastReset=1` the reset doesn't reload anything. The wrapper keeps a second copy of the app loaded and painted behind the visible one, and a reset just swaps them — no loading screen, no network. The standby copy is built about 12 seconds before the reset is due (`PrewarmSeconds`) and thrown away after the swap, so only one live instance runs between resets.
+
+If the standby isn't ready, it falls back to a normal reload by itself. Raise `PrewarmSeconds` if resets still show the loading screen.
+
 ## Updating
 
 Commit the change, then re-run `install-kiosk.cmd` on the kiosk. It overwrites the program files and **leaves `kiosk.ini` alone**, so the URL and timer survive an update.
@@ -88,7 +105,7 @@ Also in `SETUP.md`: what to do if ArcGIS refuses to be framed (one line in `kios
 | `install-kiosk.ps1` | The work behind both of the above |
 | `kiosk.ini` | **The only file you edit** — URL, timer, options |
 | `kiosk-lock.ahk` | Launches and supervises Edge, idle reset, key lockdown |
-| `kiosk-wrapper.html` | Local page that frames the app, loading and reconnect screens |
+| `kiosk-wrapper.html` | Frames the app twice over, for instant swap resets |
 | `kiosk-config.js` | Generated from `kiosk.ini` at every start — don't edit |
 | `kiosk-lockdown.reg` / `kiosk-unlock.reg` | The Windows and Edge policies |
 | `SETUP.md` | Full reference and caveats |

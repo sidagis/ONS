@@ -20,7 +20,19 @@
     -webkit-tap-highlight-color:transparent;
     touch-action:manipulation;
   }
-  #app{position:fixed;inset:0;width:100%;height:100%;border:0;display:block;background:var(--bg);}
+
+  /* Two stacked copies of the app. The active one sits on top; the
+     standby stays behind it, loaded and painted, ready to swap in. */
+  .slot{position:fixed;inset:0;width:100%;height:100%;border:0;display:block;background:var(--bg);}
+  .slot[data-role="active"]{z-index:2;}
+  .slot[data-role="standby"]{z-index:1;pointer-events:none;}
+
+  /* Small trigger zones for the controller. Transparent, and they only
+     respond to a mouse click, never to a finger. */
+  .zone{position:fixed;top:0;width:12px;height:12px;z-index:9;background:transparent;}
+  #zoneReset{left:0;}
+  #zoneWarm{right:0;}
+
   #veil{
     position:fixed;inset:0;z-index:20;
     display:none;flex-direction:column;align-items:center;justify-content:center;gap:1.5rem;
@@ -38,6 +50,7 @@
   @keyframes spin{to{transform:rotate(360deg)}}
   @media (prefers-reduced-motion:reduce){.ring{animation:none}}
   #veil p{margin:0;font-size:clamp(1rem,1.5vw,1.4rem);letter-spacing:.01em;color:var(--dim);max-width:32ch;line-height:1.5;}
+
   #dbg{
     position:fixed;left:0;bottom:0;z-index:30;display:none;
     padding:.45rem .7rem;background:rgba(0,0,0,.7);color:#6f6;
@@ -48,14 +61,15 @@
 </head>
 <body>
 
-<iframe id="app"
-        title="Kiosk application"
-        allow="geolocation; fullscreen"
-        allowfullscreen></iframe>
+<iframe id="slotA" class="slot" data-role="active"  title="Kiosk application" allow="geolocation; fullscreen; autoplay" allowfullscreen></iframe>
+<iframe id="slotB" class="slot" data-role="standby" title="Kiosk application standby" allow="geolocation; fullscreen; autoplay" allowfullscreen></iframe>
+
+<div id="zoneReset"></div>
+<div id="zoneWarm"></div>
 
 <div id="veil" data-on="1" data-spin="1">
   <div class="ring"></div>
-  <p id="veilmsg">Loadingp</p>
+  <p id="veilmsg">Loading the map</p>
 </div>
 
 <div id="dbg"></div>
@@ -67,33 +81,40 @@
 (function () {
   "use strict";
 
-  // Fallbacks, used only if kiosk-config.js is missing (e.g. someone
-  // opened this file by hand). kiosk.ini is the real source of truth.
   const DEFAULTS = {
     appUrl: "",
     idleSeconds: 25,
     loadTimeoutSeconds: 25,
-    revealDelayMs: 1400,
+    revealDelayMs: 250,
+    fastReset: true,
     retrySeconds: 10
   };
-
   const CONFIG = Object.assign({}, DEFAULTS, window.KIOSK_CONFIG || {});
 
+  // How long after the standby copy fires its load event before it is
+  // considered safe to show. Experience Builder keeps drawing for a
+  // moment after load, and this is what buys the instant swap.
+  const SETTLE_MS = 2500;
+
   /*
-   * Why the idle timer below is a fallback, not the mechanism:
+   * How the reset works
    *
-   * Events inside a cross-origin iframe (anything on arcgis.com, loaded
-   * from a file:// wrapper) are invisible to this page. No pointerdown,
-   * no keydown, nothing. A naive timer here would reset the app every
-   * 25 s while a visitor is actively panning the map.
+   * Idle detection is in kiosk-lock.ahk, because events inside a
+   * cross-origin iframe are invisible to this page - a timer here would
+   * reset the app while a visitor was panning the map.
    *
-   * So this timer only arms itself once it has proved it can see input
-   * inside the frame, which happens only when the app is same-origin.
-   * Otherwise kiosk-lock.ahk watches system idle time and sends F5.
-   * Both together are harmless.
+   * The controller then triggers a reset by clicking a 12px zone in the
+   * top-left corner. A finger can't do it: the handler ignores anything
+   * that isn't pointerType "mouse", and the kiosk has no mouse. A click
+   * in the top-right zone means "start warming the standby copy".
+   *
+   * This page publishes a token in document.title - which is the Edge
+   * window title - so the controller can confirm the swap happened. If
+   * it didn't, the controller sends F5 instead. Every failure path ends
+   * in a working reset, just a slower one.
    */
 
-  const frame = document.getElementById("app");
+  const slots = [document.getElementById("slotA"), document.getElementById("slotB")];
   const veil  = document.getElementById("veil");
   const msg   = document.getElementById("veilmsg");
   const dbg   = document.getElementById("dbg");
@@ -101,9 +122,24 @@
   const DEBUG = new URLSearchParams(location.search).has("debug");
   if (DEBUG) dbg.dataset.on = "1";
 
-  let idleTimer = null, loadTimer = null, retryTimer = null;
-  let sameOrigin = false;
-  let lastKick = Date.now();
+  const SID = Math.random().toString(36).slice(2, 6);
+  let resetCount = 0;
+
+  let active = 0;                 // index into slots
+  let loadTimer = null, retryTimer = null;
+  let warmState = "cold";         // cold | loading | ready
+  let warmReadyAt = 0;
+
+  function other() { return active === 0 ? 1 : 0; }
+
+  /* ---------- title token ---------- */
+
+  function publish() {
+    const t = "Kiosk|r" + SID + "-" + resetCount + "|" + warmState[0];
+    if (document.title !== t) document.title = t;
+  }
+
+  /* ---------- veil ---------- */
 
   function showVeil(text, spin) {
     msg.textContent = text;
@@ -112,84 +148,106 @@
   }
   function hideVeil() { veil.dataset.on = "0"; }
 
-  if (DEBUG) {
-    setInterval(function () {
-      dbg.textContent =
-        "app url:    " + CONFIG.appUrl +
-        "\nsame-origin: " + sameOrigin +
-        "\nidle timer:  " + (sameOrigin ? CONFIG.idleSeconds + "s in-page" : "delegated to AutoHotkey") +
-        "\nidle now:    " + Math.round((Date.now() - lastKick) / 1000) + "s";
-    }, 500);
+  /* ---------- cold load ---------- */
+
+  function urlOK() {
+    return CONFIG.appUrl && CONFIG.appUrl.indexOf("REPLACE_ME") === -1;
   }
 
-  /* ---------- load / reset ---------- */
-
-  function loadApp() {
-    if (!CONFIG.appUrl || CONFIG.appUrl.indexOf("REPLACE_ME") !== -1) {
+  function coldLoad() {
+    if (!urlOK()) {
       showVeil("No Experience URL is set. Open kiosk.ini and put your published app URL after AppUrl=", false);
       return;
     }
     clearTimeout(loadTimer);
     clearTimeout(retryTimer);
     showVeil("Loading the map");
-    loadTimer = setTimeout(onLoadTimeout, CONFIG.loadTimeoutSeconds * 1000);
-    sameOrigin = false;
-    frame.src = CONFIG.appUrl;
+
+    const a = slots[active];
+    a.onload = function () {
+      clearTimeout(loadTimer);
+      setTimeout(hideVeil, CONFIG.revealDelayMs);
+    };
+    loadTimer = setTimeout(function () {
+      showVeil("Reconnecting");
+      retryTimer = setTimeout(coldLoad, CONFIG.retrySeconds * 1000);
+    }, CONFIG.loadTimeoutSeconds * 1000);
+
+    a.src = CONFIG.appUrl;
   }
 
-  function onLoadTimeout() {
-    showVeil("Reconnecting");
-    retryTimer = setTimeout(loadApp, CONFIG.retrySeconds * 1000);
+  /* ---------- prewarm ---------- */
+
+  function prewarm() {
+    if (!CONFIG.fastReset || !urlOK()) return;
+    if (warmState !== "cold") return;
+
+    const b = slots[other()];
+    warmState = "loading";
+    publish();
+
+    b.onload = function () {
+      warmReadyAt = Date.now() + SETTLE_MS;
+      setTimeout(function () {
+        if (warmState === "loading") { warmState = "ready"; publish(); }
+      }, SETTLE_MS);
+    };
+    b.src = CONFIG.appUrl;
   }
 
-  frame.addEventListener("load", function () {
-    clearTimeout(loadTimer);
-    setTimeout(function () {
-      hideVeil();
-      attachInnerListeners();
-      kick();
-    }, CONFIG.revealDelayMs);
-  });
-
-  // Reset = full reload, which guarantees the app returns to its
-  // published start state: extent, panels, widget state, everything.
-  function resetApp() { location.reload(); }
-
-  // For a maintenance console or a future AHK hook: window.kioskReset()
-  window.kioskReset = function () { loadApp(); };
-
-  /* ---------- idle tracking ---------- */
-
-  function kick() {
-    lastKick = Date.now();
-    clearTimeout(idleTimer);
-    if (sameOrigin) idleTimer = setTimeout(resetApp, CONFIG.idleSeconds * 1000);
+  function warmUsable() {
+    return warmState === "ready" && Date.now() >= warmReadyAt;
   }
 
-  const EVENTS = ["pointerdown","pointermove","pointerup","touchstart","touchmove","wheel","keydown","mousemove","click"];
-  EVENTS.forEach(function (t) {
-    window.addEventListener(t, kick, { capture: true, passive: true });
-  });
+  /* ---------- reset ---------- */
 
-  function attachInnerListeners() {
-    try {
-      const doc = frame.contentDocument;
-      if (!doc || !doc.body) return;          // cross-origin, or not ready
-      sameOrigin = true;
-      EVENTS.forEach(function (t) {
-        doc.addEventListener(t, kick, { capture: true, passive: true });
-      });
-      doc.addEventListener("contextmenu", function (e) { e.preventDefault(); });
-      doc.addEventListener("dragstart",   function (e) { e.preventDefault(); });
-      kick();
-    } catch (e) {
-      sameOrigin = false;                     // expected on arcgis.com
+  function reset() {
+    if (CONFIG.fastReset && warmUsable()) {
+      swap();
+    } else {
+      // Nothing warm to show, so do it the slow way.
+      resetCount++;
+      publish();
+      location.reload();
     }
   }
 
-  /* ---------- wrapper-level input guards ---------- */
-  // These cover the wrapper only. Browser and OS shortcuts are handled
-  // by kiosk-lock.ahk and the lockdown policies.
+  function swap() {
+    const oldSlot = slots[active];
+    const newSlot = slots[other()];
+
+    newSlot.dataset.role = "active";
+    oldSlot.dataset.role = "standby";
+    active = other();
+
+    resetCount++;
+    warmState = "cold";
+    warmReadyAt = 0;
+    publish();
+
+    // Drop the copy the last visitor used, so only one live instance of
+    // the app is running between resets.
+    setTimeout(function () {
+      try { oldSlot.onload = null; oldSlot.src = "about:blank"; } catch (e) {}
+    }, 400);
+  }
+
+  window.kioskReset  = reset;      // for a maintenance console
+  window.kioskWarm   = prewarm;
+
+  /* ---------- controller trigger zones ---------- */
+
+  function zone(id, fn) {
+    document.getElementById(id).addEventListener("pointerdown", function (e) {
+      if (e.pointerType !== "mouse") return;   // a finger must never trigger this
+      e.preventDefault();
+      fn();
+    });
+  }
+  zone("zoneReset", reset);
+  zone("zoneWarm", prewarm);
+
+  /* ---------- input guards ---------- */
 
   ["contextmenu","dragstart","selectstart","gesturestart"].forEach(function (t) {
     document.addEventListener(t, function (e) { e.preventDefault(); });
@@ -201,11 +259,26 @@
   }, { capture: true });
 
   window.addEventListener("wheel", function (e) {
-    if (e.ctrlKey) e.preventDefault();        // ctrl+wheel page zoom
+    if (e.ctrlKey) e.preventDefault();
   }, { passive: false });
 
+  /* ---------- diagnostics ---------- */
+
+  if (DEBUG) {
+    setInterval(function () {
+      dbg.textContent =
+        "app url:   " + CONFIG.appUrl +
+        "\nactive:    slot" + (active === 0 ? "A" : "B") +
+        "\nstandby:   " + warmState + (warmState === "ready" ? (warmUsable() ? " (usable)" : " (settling)") : "") +
+        "\nresets:    " + resetCount +
+        "\nfast:      " + CONFIG.fastReset +
+        "\ntitle:     " + document.title;
+    }, 500);
+  }
+
   /* ---------- go ---------- */
-  loadApp();
+  publish();
+  coldLoad();
 })();
 </script>
 </body>

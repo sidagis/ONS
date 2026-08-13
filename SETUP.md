@@ -42,9 +42,53 @@ Everything is here, and `kiosk-lock.ahk` regenerates `kiosk-config.js` from it a
 | `ExitToDesktop` | Alt+F4 also starts Explorer, so whoever exits gets a desktop |
 | `StartUrl` | Set this to bypass the wrapper entirely — see below |
 | `ClearProfileOnStart` | Wipes `C:\KioskProfile` at every start. Cleanest state, slower first load |
-| `RevealDelayMs` | How long the loading screen stays up after the app reports ready |
+| `RevealDelayMs` | Loading screen hold after a cold load. Does not affect a fast reset |
+| `FastReset` | Swap to a pre-loaded copy instead of reloading |
+| `PrewarmSeconds` | How early to start building that copy |
+| `MuteOutput` | Mute the playback device at every start |
+| `HoldForAudio` | Hold the reset while Edge is producing audio |
 
 While the kiosk is running there's a tray icon (invisible in full kiosk mode, since there's no taskbar) with **Reset app now**, **Edit kiosk.ini** and **Exit kiosk** — handy during testing.
+
+## Not resetting during a video
+
+A 25 second timeout and a 2 minute video are in direct conflict: someone watching touches nothing, so as far as Windows is concerned they left. The kiosk therefore holds the reset back while it believes a video is playing.
+
+**Signal 1, Edge audio.** The controller walks the Windows audio sessions on the default playback device and looks for an active one owned by `msedge.exe`. No changes to the published app, so the same app still works normally on mobile.
+
+The important detail: **mute the output device, never the player.** A muted output device still has Edge producing the stream — Windows just throws it away — so the session stays active and the detector keeps working. A video muted inside the Vimeo player produces no stream at all, and the detector goes blind. `MuteOutput=1` in `kiosk.ini` makes the controller mute the default playback device itself at every start, so nobody has to remember. There's a **Mute output again** item in the tray menu too.
+
+Two consequences worth planning for. Your Vimeo embed must not be set to muted autoplay — the player has to be unmuted for this to work, which is fine because the device is silent anyway. And the kiosk needs a playback device that exists and is enabled: if the machine has no audio endpoint at all, there are no sessions to inspect, the detector switches itself off and writes a line to `C:\Kiosk\kiosk-log.txt`. HDMI audio to the display, muted, is the ideal arrangement. Unplugging the speakers is fine; disabling the device in Windows is not.
+
+**Signal 2, screen motion — the backstop.** If the player has visible controls, a visitor can mute it by hand and signal 1 goes quiet. Set `VideoRect` and the controller samples a 4×4 grid of pixels inside that rectangle every second; while they keep changing, something is playing. A static poster frame doesn't trigger it. Given the mute constraint, it's worth setting this even if audio detection tests fine.
+
+To set the rectangle: put `BlockMouseButtons=0` in `kiosk.ini` temporarily, start the kiosk, right-click the tray icon → **Mark video area**, then tap the two opposite corners of the video. It saves to `kiosk.ini` and takes effect immediately. Set `BlockMouseButtons` back to `1` afterwards.
+
+Keep the rectangle inside the video. Point it at the map and an animated layer or a spinning progress indicator will hold the reset forever — well, until the ceiling.
+
+**The ceiling.** `MaxHoldSeconds` (default 180) is measured from the last real touch, and nothing holds the reset past it. So the worst case with a stuck detector is a kiosk that resets three minutes late, not one that never resets. Longest video plus about a minute; for 2 minutes, 180.
+
+**After the video.** `PostVideoSeconds` (default 20) is the gap between playback stopping and the reset firing.
+
+Verify with the tray icon → **Status**, which shows what each detector sees right now, whether the output device is actually muted, and how the idle count compares to the threshold.
+
+## Making the reset instant
+
+A reload means Experience Builder starts from nothing: parse the bundle, build the map, fetch tiles. Trimming the loading screen only hides that, it doesn't remove it.
+
+So with `FastReset=1` the wrapper doesn't reload at all. It keeps **two stacked copies** of the app. One is visible; the other sits behind it, already loaded and painted, at the published start state. A reset swaps their stacking order — instant, no loading screen, no network. The copy the last visitor used is then dropped, so between resets only one live instance is running.
+
+The standby copy is built on demand, `PrewarmSeconds` (default 12) before the reset is due. The controller knows the idle time, so it triggers the prewarm; raise it if resets still show the loading screen, because that means the standby wasn't finished.
+
+**How the controller talks to the page.** There are two 12-pixel transparent zones in the top corners: top-left means reset, top-right means prewarm. They ignore any pointer event that isn't `pointerType === "mouse"`, and the kiosk has no mouse — so a visitor's finger in the corner can't trigger anything, while an injected click can. The controller tries a posted click first, which moves no cursor at all, and only falls back to a real click if that's ignored.
+
+**How it knows it worked.** The wrapper publishes a token in `document.title`, which is the Edge window title, which AutoHotkey can read. If the token doesn't change within about 350 ms, the controller sends F5 instead. Every failure path still ends in a correct reset — worst case you're back to the old behaviour with the loading screen, never a kiosk that doesn't reset.
+
+Two things to know. During the prewarm window there are briefly two Experience Builder instances live, which on weak hardware means two WebGL map contexts; if the kiosk PC is modest, watch memory during testing and lower `PrewarmSeconds` if it struggles. And the swapped-in copy was loaded 12-ish seconds earlier, so time-sensitive layers are that stale at the moment of the swap.
+
+`RevealDelayMs` still applies, but only to the first cold load and the F5 fallback. It's 250 ms now instead of 1400.
+
+`FastReset` needs the wrapper, so it's off automatically if you've set `StartUrl`.
 
 ## If ArcGIS refuses to be framed
 
@@ -61,6 +105,10 @@ Add `?debug=1` to the wrapper URL (temporarily set `StartUrl=file:///C:/Kiosk/ki
 | Symptom | Likely cause |
 |---|---|
 | Resets while someone is using it | `IdleSeconds` too low, or the app is same-origin and both timers are running short |
+| Resets during the video | No detector firing. Tray icon → **Status**: is the video muted in the *player* rather than the device, and is `VideoRect` unset? |
+| Never resets after the video | A detector stuck on — usually a `VideoRect` covering something animated. `MaxHoldSeconds` caps the damage |
+| Reset still shows the loading screen | The standby copy wasn't ready. Raise `PrewarmSeconds`. Tray → **Status** shows whether the wrapper token is visible at all |
+| Mouse pointer parked in a corner | A real click was needed because the posted one was ignored. It hides again on the next touch |
 | Never resets | AutoHotkey isn't running — check for the tray icon, or start it from the shortcut |
 | Map is blank grey after lockdown | A layer or basemap host is missing from the Edge allow list. Re-run lockdown after fixing `AppUrl`, or add hosts under `HKLM\SOFTWARE\Policies\Microsoft\Edge\URLAllowlist` |
 | Loading screen forever | Framing blocked, or no network. See above |
