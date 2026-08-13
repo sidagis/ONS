@@ -1,0 +1,33 @@
+Windows Registry Editor Version 5.00
+
+; =====================================================================
+;  kiosk-unlock.reg
+;  Reverses kiosk-lockdown.reg. Apply as the kiosk user, then reboot.
+;  Keep a copy on a USB stick - if you lock yourself out of Task Manager
+;  and the Start menu at the same time, this is the way back in.
+; =====================================================================
+
+[-HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer]
+
+[-HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Policies\System]
+
+[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge\URLBlocklist]
+
+[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge\URLAllowlist]
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System]
+"HideFastUserSwitching"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\EdgeUI]
+"AllowEdgeSwipe"=dword:00000001
+
+[HKEY_CURRENT_USER\Software\Microsoft\Wisp\Touch]
+"TouchMode_hold"=dword:00000001
+
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\PushNotifications]
+"ToastEnabled"=dword:00000001
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge]
+"DeveloperToolsAvailability"=dword:00000001
+"PrintingEnabled"=dword:00000001
+"AllowFileSelectionDialogs"=dword:00000001

@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Kiosk</title>
+<style>
+  :root{
+    --bg:#0a1f2b;
+    --fg:#e7f2f6;
+    --dim:#7ba3b2;
+    --accent:#22c1e0;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);overflow:hidden;overscroll-behavior:none;}
+  *,*::before,*::after{
+    box-sizing:border-box;
+    -webkit-user-select:none;user-select:none;
+    -webkit-touch-callout:none;
+    -webkit-tap-highlight-color:transparent;
+    touch-action:manipulation;
+  }
+  #app{position:fixed;inset:0;width:100%;height:100%;border:0;display:block;background:var(--bg);}
+  #veil{
+    position:fixed;inset:0;z-index:20;
+    display:none;flex-direction:column;align-items:center;justify-content:center;gap:1.5rem;
+    padding:2rem;text-align:center;
+    background:var(--bg);color:var(--fg);
+    font-family:"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;
+  }
+  #veil[data-on="1"]{display:flex;}
+  .ring{
+    width:3.25rem;height:3.25rem;border-radius:50%;
+    border:3px solid rgba(255,255,255,.14);border-top-color:var(--accent);
+    animation:spin .9s linear infinite;
+  }
+  #veil[data-spin="0"] .ring{display:none;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @media (prefers-reduced-motion:reduce){.ring{animation:none}}
+  #veil p{margin:0;font-size:clamp(1rem,1.5vw,1.4rem);letter-spacing:.01em;color:var(--dim);max-width:32ch;line-height:1.5;}
+  #dbg{
+    position:fixed;left:0;bottom:0;z-index:30;display:none;
+    padding:.45rem .7rem;background:rgba(0,0,0,.7);color:#6f6;
+    font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre;pointer-events:none;
+  }
+  #dbg[data-on="1"]{display:block;}
+</style>
+</head>
+<body>
+
+<iframe id="app"
+        title="Kiosk application"
+        allow="geolocation; fullscreen"
+        allowfullscreen></iframe>
+
+<div id="veil" data-on="1" data-spin="1">
+  <div class="ring"></div>
+  <p id="veilmsg">Loading the map</p>
+</div>
+
+<div id="dbg"></div>
+
+<!-- Generated from kiosk.ini every time kiosk-lock.ahk starts. -->
+<script src="kiosk-config.js"></script>
+
+<script>
+(function () {
+  "use strict";
+
+  // Fallbacks, used only if kiosk-config.js is missing (e.g. someone
+  // opened this file by hand). kiosk.ini is the real source of truth.
+  const DEFAULTS = {
+    appUrl: "",
+    idleSeconds: 25,
+    loadTimeoutSeconds: 25,
+    revealDelayMs: 1400,
+    retrySeconds: 10
+  };
+
+  const CONFIG = Object.assign({}, DEFAULTS, window.KIOSK_CONFIG || {});
+
+  /*
+   * Why the idle timer below is a fallback, not the mechanism:
+   *
+   * Events inside a cross-origin iframe (anything on arcgis.com, loaded
+   * from a file:// wrapper) are invisible to this page. No pointerdown,
+   * no keydown, nothing. A naive timer here would reset the app every
+   * 25 s while a visitor is actively panning the map.
+   *
+   * So this timer only arms itself once it has proved it can see input
+   * inside the frame, which happens only when the app is same-origin.
+   * Otherwise kiosk-lock.ahk watches system idle time and sends F5.
+   * Both together are harmless.
+   */
+
+  const frame = document.getElementById("app");
+  const veil  = document.getElementById("veil");
+  const msg   = document.getElementById("veilmsg");
+  const dbg   = document.getElementById("dbg");
+
+  const DEBUG = new URLSearchParams(location.search).has("debug");
+  if (DEBUG) dbg.dataset.on = "1";
+
+  let idleTimer = null, loadTimer = null, retryTimer = null;
+  let sameOrigin = false;
+  let lastKick = Date.now();
+
+  function showVeil(text, spin) {
+    msg.textContent = text;
+    veil.dataset.spin = spin === false ? "0" : "1";
+    veil.dataset.on = "1";
+  }
+  function hideVeil() { veil.dataset.on = "0"; }
+
+  if (DEBUG) {
+    setInterval(function () {
+      dbg.textContent =
+        "app url:    " + CONFIG.appUrl +
+        "\nsame-origin: " + sameOrigin +
+        "\nidle timer:  " + (sameOrigin ? CONFIG.idleSeconds + "s in-page" : "delegated to AutoHotkey") +
+        "\nidle now:    " + Math.round((Date.now() - lastKick) / 1000) + "s";
+    }, 500);
+  }
+
+  /* ---------- load / reset ---------- */
+
+  function loadApp() {
+    if (!CONFIG.appUrl || CONFIG.appUrl.indexOf("REPLACE_ME") !== -1) {
+      showVeil("No Experience URL is set. Open kiosk.ini and put your published app URL after AppUrl=", false);
+      return;
+    }
+    clearTimeout(loadTimer);
+    clearTimeout(retryTimer);
+    showVeil("Loading the map");
+    loadTimer = setTimeout(onLoadTimeout, CONFIG.loadTimeoutSeconds * 1000);
+    sameOrigin = false;
+    frame.src = CONFIG.appUrl;
+  }
+
+  function onLoadTimeout() {
+    showVeil("Reconnecting");
+    retryTimer = setTimeout(loadApp, CONFIG.retrySeconds * 1000);
+  }
+
+  frame.addEventListener("load", function () {
+    clearTimeout(loadTimer);
+    setTimeout(function () {
+      hideVeil();
+      attachInnerListeners();
+      kick();
+    }, CONFIG.revealDelayMs);
+  });
+
+  // Reset = full reload, which guarantees the app returns to its
+  // published start state: extent, panels, widget state, everything.
+  function resetApp() { location.reload(); }
+
+  // For a maintenance console or a future AHK hook: window.kioskReset()
+  window.kioskReset = function () { loadApp(); };
+
+  /* ---------- idle tracking ---------- */
+
+  function kick() {
+    lastKick = Date.now();
+    clearTimeout(idleTimer);
+    if (sameOrigin) idleTimer = setTimeout(resetApp, CONFIG.idleSeconds * 1000);
+  }
+
+  const EVENTS = ["pointerdown","pointermove","pointerup","touchstart","touchmove","wheel","keydown","mousemove","click"];
+  EVENTS.forEach(function (t) {
+    window.addEventListener(t, kick, { capture: true, passive: true });
+  });
+
+  function attachInnerListeners() {
+    try {
+      const doc = frame.contentDocument;
+      if (!doc || !doc.body) return;          // cross-origin, or not ready
+      sameOrigin = true;
+      EVENTS.forEach(function (t) {
+        doc.addEventListener(t, kick, { capture: true, passive: true });
+      });
+      doc.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+      doc.addEventListener("dragstart",   function (e) { e.preventDefault(); });
+      kick();
+    } catch (e) {
+      sameOrigin = false;                     // expected on arcgis.com
+    }
+  }
+
+  /* ---------- wrapper-level input guards ---------- */
+  // These cover the wrapper only. Browser and OS shortcuts are handled
+  // by kiosk-lock.ahk and the lockdown policies.
+
+  ["contextmenu","dragstart","selectstart","gesturestart"].forEach(function (t) {
+    document.addEventListener(t, function (e) { e.preventDefault(); });
+  });
+
+  window.addEventListener("keydown", function (e) {
+    if (e.altKey && e.key === "F4") return;   // the one permitted escape
+    e.preventDefault();
+  }, { capture: true });
+
+  window.addEventListener("wheel", function (e) {
+    if (e.ctrlKey) e.preventDefault();        // ctrl+wheel page zoom
+  }, { passive: false });
+
+  /* ---------- go ---------- */
+  loadApp();
+})();
+</script>
+</body>
+</html>

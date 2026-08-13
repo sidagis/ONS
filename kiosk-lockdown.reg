@@ -1,0 +1,90 @@
+Windows Registry Editor Version 5.00
+
+; =====================================================================
+;  kiosk-lockdown.reg
+;  Apply on the kiosk machine while logged in as the KIOSK USER
+;  (some keys are per-user). Reboot afterwards.
+;  Keep kiosk-unlock.reg handy to reverse the per-user parts.
+; =====================================================================
+
+; ---------------------------------------------------------------------
+;  Windows shell / hotkey restrictions (per user)
+; ---------------------------------------------------------------------
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer]
+"NoWinKeys"=dword:00000001
+"NoRun"=dword:00000001
+"NoClose"=dword:00000001
+"NoLogoff"=dword:00000001
+"NoControlPanel"=dword:00000001
+"NoSetTaskbar"=dword:00000001
+"NoTrayContextMenu"=dword:00000001
+"NoViewContextMenu"=dword:00000001
+
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Policies\System]
+"DisableTaskMgr"=dword:00000001
+"DisableLockWorkstation"=dword:00000001
+"DisableChangePassword"=dword:00000001
+
+; Remove Switch User from the security screen.
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System]
+"HideFastUserSwitching"=dword:00000001
+
+; ---------------------------------------------------------------------
+;  Touch behaviour
+; ---------------------------------------------------------------------
+; Kill press-and-hold = right-click. Belt and braces with the AHK
+; RButton block: this stops the gesture at source, so no ripple circle
+; appears under the finger either.
+[HKEY_CURRENT_USER\Software\Microsoft\Wisp\Touch]
+"TouchMode_hold"=dword:00000000
+
+; No edge swipes (Task View from the left, notifications from the right).
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\EdgeUI]
+"AllowEdgeSwipe"=dword:00000000
+
+; No toast notifications over the app.
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\PushNotifications]
+"ToastEnabled"=dword:00000000
+
+; No screen saver.
+[HKEY_CURRENT_USER\Control Panel\Desktop]
+"ScreenSaveActive"="0"
+"ScreenSaverIsSecure"="0"
+
+; ---------------------------------------------------------------------
+;  Microsoft Edge policies
+; ---------------------------------------------------------------------
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge]
+"HideFirstRunExperience"=dword:00000001
+"DeveloperToolsAvailability"=dword:00000002
+"InPrivateModeAvailability"=dword:00000001
+"BrowserSignin"=dword:00000000
+"SyncDisabled"=dword:00000001
+"PasswordManagerEnabled"=dword:00000000
+"AutofillAddressEnabled"=dword:00000000
+"AutofillCreditCardEnabled"=dword:00000000
+"TranslateEnabled"=dword:00000000
+"EdgeCollectionsEnabled"=dword:00000000
+"ShowRecommendationsEnabled"=dword:00000000
+"PromotionalTabsEnabled"=dword:00000000
+"EdgeShoppingAssistantEnabled"=dword:00000000
+"UserFeedbackAllowed"=dword:00000000
+"PrintingEnabled"=dword:00000000
+"SavingBrowserHistoryDisabled"=dword:00000001
+"DefaultNotificationsSetting"=dword:00000002
+"DefaultGeolocationSetting"=dword:00000001
+"BackgroundModeEnabled"=dword:00000000
+"AllowFileSelectionDialogs"=dword:00000000
+"DownloadRestrictions"=dword:00000003
+
+; Whitelist browsing. Even if someone escapes the app, there is nowhere
+; to go. ADD YOUR OWN PORTAL / SERVICE HOSTS to the allow list before
+; applying, or the app will break.
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge\URLBlocklist]
+"1"="*"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge\URLAllowlist]
+"1"="file:///C:/Kiosk/"
+"2"="[*.]arcgis.com"
+"3"="[*.]arcgisonline.com"
+"4"="[*.]arcgis.net"
