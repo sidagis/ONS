@@ -82,7 +82,15 @@ The standby copy is built on demand, `PrewarmSeconds` (default 12) before the re
 
 **How the controller talks to the page.** There are two 12-pixel transparent zones in the top corners: top-left means reset, top-right means prewarm. They ignore any pointer event that isn't `pointerType === "mouse"`, and the kiosk has no mouse — so a visitor's finger in the corner can't trigger anything, while an injected click can. The controller tries a posted click first, which moves no cursor at all, and only falls back to a real click if that's ignored.
 
-**How it knows it worked.** The wrapper publishes a token in `document.title`, which is the Edge window title, which AutoHotkey can read. If the token doesn't change within about 350 ms, the controller sends F5 instead. Every failure path still ends in a correct reset — worst case you're back to the old behaviour with the loading screen, never a kiosk that doesn't reset.
+**How it knows it worked — and why that's off by default.** The wrapper acknowledges a trigger two ways: it flips a 6-pixel marker in the bottom-left corner, and it bumps a token in `document.title`. The controller can read the pixel with `PixelGetColor` and the title with `WinGetTitle`.
+
+On some Edge builds neither channel comes through: kiosk fullscreen doesn't always push `document.title` into the window text, and the pixel read can miss under display scaling. When that happens the swap works perfectly but is never confirmed, so the controller assumes failure and sends F5 — meaning you see a flawless instant reset immediately followed by a reload. The reload *is* the problem in that situation.
+
+So `ResetFallback=0` is the default: one posted click, trusted, no verification and no reload. `last reset via` in the Status dialog will read `swap (unverified)`.
+
+The cost of trusting it is that a swap which silently stopped working would leave the kiosk never resetting, with nothing to tell you. `IdleReloadMinutes` (default 30) closes that: after half an hour with no visitor input at all, the kiosk does one full reload. It only ever fires on a kiosk nobody is using, it can't interrupt anyone, and it doubles as ordinary housekeeping for a machine that runs for months. Set `ResetFallback=1` if you'd rather have the old immediate verification and are willing to accept the reload when it can't confirm.
+
+**Resets need a visitor.** The controller only resets if somebody has actually touched the screen since the last reset — otherwise an unattended kiosk would swap to a fresh copy every 25 seconds all night, reloading Experience Builder thousands of times before morning. Prewarming is gated the same way. Status shows this as `visitor since`.
 
 Two things to know. During the prewarm window there are briefly two Experience Builder instances live, which on weak hardware means two WebGL map contexts; if the kiosk PC is modest, watch memory during testing and lower `PrewarmSeconds` if it struggles. And the swapped-in copy was loaded 12-ish seconds earlier, so time-sensitive layers are that stale at the moment of the swap.
 
@@ -107,7 +115,8 @@ Add `?debug=1` to the wrapper URL (temporarily set `StartUrl=file:///C:/Kiosk/ki
 | Resets while someone is using it | `IdleSeconds` too low, or the app is same-origin and both timers are running short |
 | Resets during the video | No detector firing. Tray icon → **Status**: is the video muted in the *player* rather than the device, and is `VideoRect` unset? |
 | Never resets after the video | A detector stuck on — usually a `VideoRect` covering something animated. `MaxHoldSeconds` caps the damage |
-| Reset still shows the loading screen | The standby copy wasn't ready. Raise `PrewarmSeconds`. Tray → **Status** shows whether the wrapper token is visible at all |
+| Instant reset, then a loading screen | The swap wasn't acknowledged so the fallback reloaded. Set `ResetFallback=0` |
+| Reset still shows the loading screen | The standby copy wasn't ready. Raise `PrewarmSeconds` |
 | Mouse pointer parked in a corner | A real click was needed because the posted one was ignored. It hides again on the next touch |
 | Never resets | AutoHotkey isn't running — check for the tray icon, or start it from the shortcut |
 | Map is blank grey after lockdown | A layer or basemap host is missing from the Edge allow list. Re-run lockdown after fixing `AppUrl`, or add hosts under `HKLM\SOFTWARE\Policies\Microsoft\Edge\URLAllowlist` |

@@ -43,6 +43,8 @@ global lastResetHow := "-"         ; diagnostics
 global lastRealInput := A_TickCount
 global suppressUntil := 0
 global warmSent := false
+global inputSinceReset := false    ; has a visitor touched it since the last reset
+global houseKept := false
 
 global EDGE_EXE := FindEdge()
 if (EDGE_EXE = "") {
@@ -107,6 +109,8 @@ LoadConfig() {
 
     c["FastReset"]           := NumOr(IniRead(INI, "Kiosk", "FastReset", 1), 1)
     c["PrewarmSeconds"]      := NumOr(IniRead(INI, "Kiosk", "PrewarmSeconds", 12), 12)
+    c["ResetFallback"]       := NumOr(IniRead(INI, "Kiosk", "ResetFallback", 0), 0)
+    c["IdleReloadMinutes"]   := NumOr(IniRead(INI, "Kiosk", "IdleReloadMinutes", 30), 30)
 
     if (c["IdleSeconds"] < 5)                          ; a typo must not brick the kiosk
         c["IdleSeconds"] := 5
@@ -227,10 +231,13 @@ BuildEdgeArgs() {
 ; screen during that window, the next tick still picks it up, because
 ; A_TimeIdle keeps counting from their touch.
 UpdateIdle() {
-    global lastRealInput, suppressUntil
+    global lastRealInput, suppressUntil, inputSinceReset, houseKept
     t := A_TickCount - A_TimeIdle
-    if (t > lastRealInput && A_TickCount > suppressUntil)
+    if (t > lastRealInput && A_TickCount > suppressUntil) {
         lastRealInput := t
+        inputSinceReset := true       ; a real visitor, not one of our clicks
+        houseKept := false
+    }
 }
 
 Injecting(ms := 1500) {
@@ -248,6 +255,7 @@ IdleMs() {
 ; =====================================================================
 IdleWatch() {
     global CFG, exiting, mediaLastSeen, mediaWhy, lastRealInput, warmSent, USES_WRAPPER
+    global inputSinceReset, houseKept
     static fired := false
 
     if (exiting)
@@ -269,11 +277,27 @@ IdleWatch() {
         fired := false
 
         ; Start loading the standby copy shortly before the reset is due,
-        ; so the swap is instant when it happens.
-        if (CFG["FastReset"] && USES_WRAPPER && !warmSent
+        ; so the swap is instant when it happens. Only worth doing if
+        ; somebody has actually used the app since the last reset.
+        if (CFG["FastReset"] && USES_WRAPPER && !warmSent && inputSinceReset
             && idle >= (CFG["IdleSeconds"] - CFG["PrewarmSeconds"]) * 1000) {
             warmSent := true
             TapZone("warm")
+        }
+        return
+    }
+
+    ; Nobody has touched the screen since the last reset, so the app is
+    ; already sitting on its front page. Resetting again would just churn
+    ; through the night - but do one full reload after a long quiet spell,
+    ; as housekeeping and as a safety net in case a swap silently failed.
+    if (!inputSinceReset) {
+        if (CFG["IdleReloadMinutes"] > 0 && !houseKept
+            && idle >= CFG["IdleReloadMinutes"] * 60000) {
+            houseKept := true
+            LogLine("housekeeping reload after " CFG["IdleReloadMinutes"] " idle minutes")
+            HardReload()
+            lastRealInput := A_TickCount
         }
         return
     }
@@ -291,6 +315,7 @@ IdleWatch() {
         mediaWhy := ""
         ResetApp()
         lastRealInput := A_TickCount     ; the idle clock restarts now
+        inputSinceReset := false
         warmSent := false
     }
 }
@@ -460,6 +485,17 @@ ResetApp() {
     global CFG, USES_WRAPPER, lastResetHow
 
     if (CFG["FastReset"] && USES_WRAPPER) {
+
+        ; Trust the swap. One posted click, no verification, no reload.
+        ; Use this when resets work but are never acknowledged - the
+        ; fallback then fires every single time, and the reload it does is
+        ; exactly the loading screen fast reset exists to avoid.
+        if (!CFG["ResetFallback"]) {
+            TapZone("reset", false)
+            lastResetHow := "swap (unverified)"
+            return
+        }
+
         tokBefore := ResetToken()
         pixBefore := AckPixel()
         if (tokBefore != "" || pixBefore != "") {
@@ -644,6 +680,7 @@ BuildTrayMenu() {
     m.Add("Mark video area", (*) => MarkVideoArea())
     m.Add()
     m.Add("Reset app now", (*) => ResetApp())
+    m.Add("Hard reload now", (*) => HardReload())
     m.Add("Mute output again", (*) => MuteOutput())
     m.Add("Edit kiosk.ini", (*) => Run('notepad.exe "' INI '"'))
     m.Add()
@@ -653,7 +690,7 @@ BuildTrayMenu() {
 }
 
 ShowStatus() {
-    global CFG, mediaLastSeen, mediaWhy, lastResetHow, USES_WRAPPER
+    global CFG, mediaLastSeen, mediaWhy, lastResetHow, USES_WRAPPER, inputSinceReset
     live := DetectVideo()
     ago := mediaLastSeen ? Round((A_TickCount - mediaLastSeen) / 1000) " s ago" : "never"
     tok := ResetToken()
@@ -668,7 +705,9 @@ ShowStatus() {
         . "  now:            " Round(IdleMs() / 1000) " s of " CFG["IdleSeconds"] " s`n"
         . "  hold ceiling:   " CFG["MaxHoldSeconds"] " s`n`n"
         . "RESET`n"
-        . "  fast reset:     " (CFG["FastReset"] && USES_WRAPPER ? "on" : "off") "`n"
+        . "  fast reset:     " (CFG["FastReset"] && USES_WRAPPER ? "on" : "off")
+                                (CFG["FastReset"] && USES_WRAPPER && !CFG["ResetFallback"] ? ", unverified (no reload fallback)" : "") "`n"
+        . "  visitor since:  " (inputSinceReset ? "yes - a reset is due when idle" : "no - already on the front page") "`n"
         . "  ack pixel:      " (AckPixel() != "" ? AckPixel() " (this is what confirms a swap)" : "unreadable") "`n"
         . "  wrapper token:  " (tok != "" ? tok : "not visible (harmless, the pixel is the real channel)") "`n"
         . "  last reset via: " lastResetHow

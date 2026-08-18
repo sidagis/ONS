@@ -74,7 +74,9 @@ Check it with the tray icon → **Status** before the stand goes public. The tra
 
 With `FastReset=1` the reset doesn't reload anything. The wrapper keeps a second copy of the app loaded and painted behind the visible one, and a reset just swaps them — no loading screen, no network. The standby copy is built about 12 seconds before the reset is due (`PrewarmSeconds`) and thrown away after the swap, so only one live instance runs between resets.
 
-If the standby isn't ready, it falls back to a normal reload by itself. Raise `PrewarmSeconds` if resets still show the loading screen.
+If the standby isn't ready it falls back to a normal reload. Raise `PrewarmSeconds` if resets still show the loading screen.
+
+The controller trusts the swap rather than verifying it (`ResetFallback=0`), because on some Edge builds the acknowledgement never arrives and the verification failure causes a reload right after a perfectly good reset. `IdleReloadMinutes=30` is the safety net: one full reload after half an hour with nobody using the kiosk.
 
 ## Updating
 
