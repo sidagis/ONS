@@ -122,8 +122,16 @@
   const DEBUG = new URLSearchParams(location.search).has("debug");
   if (DEBUG) dbg.dataset.on = "1";
 
+  // Ignore a second reset trigger this soon after one was honoured. The
+  // controller can click twice if it can't confirm the first click fast
+  // enough, and without this lock the duplicate falls through to a full
+  // reload - which is the loading screen we are trying to eliminate.
+  const RESET_LOCK_MS = 5000;
+
   const SID = Math.random().toString(36).slice(2, 6);
   let resetCount = 0;
+  let trigCount = 0;
+  let lastResetAt = 0;
 
   let active = 0;                 // index into slots
   let loadTimer = null, retryTimer = null;
@@ -134,8 +142,10 @@
 
   /* ---------- title token ---------- */
 
+  // Every trigger bumps the token, honoured or not, so the controller
+  // sees its click land immediately and has no reason to click again.
   function publish() {
-    const t = "Kiosk|r" + SID + "-" + resetCount + "|" + warmState[0];
+    const t = "Kiosk|r" + SID + "-" + resetCount + "." + trigCount + "|" + warmState[0];
     if (document.title !== t) document.title = t;
   }
 
@@ -232,6 +242,14 @@
     }, 400);
   }
 
+  function onResetTrigger() {
+    trigCount++;
+    publish();                                   // acknowledge instantly
+    if (Date.now() - lastResetAt < RESET_LOCK_MS) return;   // duplicate click
+    lastResetAt = Date.now();
+    reset();
+  }
+
   window.kioskReset  = reset;      // for a maintenance console
   window.kioskWarm   = prewarm;
 
@@ -244,7 +262,7 @@
       fn();
     });
   }
-  zone("zoneReset", reset);
+  zone("zoneReset", onResetTrigger);
   zone("zoneWarm", prewarm);
 
   /* ---------- input guards ---------- */
@@ -270,7 +288,7 @@
         "app url:   " + CONFIG.appUrl +
         "\nactive:    slot" + (active === 0 ? "A" : "B") +
         "\nstandby:   " + warmState + (warmState === "ready" ? (warmUsable() ? " (usable)" : " (settling)") : "") +
-        "\nresets:    " + resetCount +
+        "\nresets:    " + resetCount + "  (triggers " + trigCount + ")" +
         "\nfast:      " + CONFIG.fastReset +
         "\ntitle:     " + document.title;
     }, 500);

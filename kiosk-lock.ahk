@@ -98,7 +98,9 @@ LoadConfig() {
     c["ClearProfileOnStart"] := NumOr(IniRead(INI, "Kiosk", "ClearProfileOnStart", 0), 0)
 
     c["HoldForAudio"]        := NumOr(IniRead(INI, "Kiosk", "HoldForAudio", 1), 1)
+    c["AudioAnyProcess"]     := NumOr(IniRead(INI, "Kiosk", "AudioAnyProcess", 1), 1)
     c["MuteOutput"]          := NumOr(IniRead(INI, "Kiosk", "MuteOutput", 1), 1)
+    c["DisableVideoOverlay"] := NumOr(IniRead(INI, "Kiosk", "DisableVideoOverlay", 1), 1)
     c["VideoRect"]           := Trim(IniRead(INI, "Kiosk", "VideoRect", ""))
     c["MaxHoldSeconds"]      := NumOr(IniRead(INI, "Kiosk", "MaxHoldSeconds", 180), 180)
     c["PostVideoSeconds"]    := NumOr(IniRead(INI, "Kiosk", "PostVideoSeconds", 20), 20)
@@ -190,7 +192,16 @@ JsEsc(s) => StrReplace(StrReplace(s, "\", "\\"), '"', '\"')
 
 BuildEdgeArgs() {
     global CFG, START_URL
-    return '--kiosk "' START_URL '"'
+    ; Hardware video overlays can put video frames on a separate plane
+    ; that never reaches the composited desktop image - so a screen
+    ; sample of a playing video reads as a static black rectangle and the
+    ; motion detector sees nothing. Turning overlays off costs a little
+    ; video efficiency and makes the pixels readable.
+    overlay := CFG["DisableVideoOverlay"]
+        ? ' --disable-direct-composition-video-overlays'
+        . ' --disable-features=DirectCompositionVideoSwapChain,UseMultiPlaneFormatForHardwareVideo'
+        : ''
+    return '--kiosk "' START_URL '"' overlay
         . ' --edge-kiosk-type=fullscreen'
         . ' --kiosk-idle-timeout-minutes=0'
         . ' --user-data-dir="' CFG["UserDataDir"] '"'
@@ -304,45 +315,21 @@ DetectVideo() {
 ; video muted inside the player is a different matter - then Edge
 ; produces nothing and this detector goes quiet.
 EdgeAudioActive() {
+    global CFG
     static broken := false
     if (broken)
         return false
 
     try {
-        ; MMDeviceEnumerator -> default render endpoint
-        enum := ComObject("{BCDE0395-E52F-467C-8E3D-C4579291692E}"
-                        , "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
-        ComCall(4, enum, "int", 0, "int", 1, "ptr*", &devPtr := 0)   ; GetDefaultAudioEndpoint(eRender, eMultimedia)
-        dev := ComValue(13, devPtr)
-
-        ; IMMDevice::Activate(IAudioSessionManager2)
-        iid := Buffer(16, 0)
-        DllCall("ole32\CLSIDFromString", "wstr", "{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}", "ptr", iid)
-        ComCall(3, dev, "ptr", iid, "uint", 0, "ptr", 0, "ptr*", &mgrPtr := 0)
-        mgr := ComValue(13, mgrPtr)
-
-        ComCall(5, mgr, "ptr*", &sePtr := 0)                          ; GetSessionEnumerator
-        se := ComValue(13, sePtr)
-        ComCall(3, se, "int*", &count := 0)                           ; GetCount
-
-        Loop count {
-            ComCall(4, se, "int", A_Index - 1, "ptr*", &scPtr := 0)   ; GetSession
-            sc := ComValue(13, scPtr)
-
-            state := -1
-            ComCall(3, sc, "int*", &state)                            ; GetState: 0 inactive, 1 active, 2 expired
-            if (state != 1)
+        for s in EnumAudioSessions() {
+            if (s["state"] != 1)                  ; 1 = AudioSessionStateActive
                 continue
-
-            ; An active session is enough on a kiosk, but confirm the
-            ; owner when we can, so a system sound cannot hold the reset.
-            owner := ""
-            try {
-                sc2 := ComObjQuery(sc, "{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}")
-                ComCall(14, sc2, "uint*", &pid := 0)                  ; IAudioSessionControl2::GetProcessId
-                owner := ProcessGetName(pid)
-            }
-            if (owner = "" || owner = "msedge.exe")
+            if (CFG["AudioAnyProcess"])
+                return true
+            ; Edge renders audio from a utility child process, also named
+            ; msedge.exe. An unknown owner counts, because failing to read
+            ; the name should not mean failing to see the video.
+            if (s["name"] = "" || s["name"] = "msedge.exe")
                 return true
         }
     } catch as e {
@@ -352,18 +339,58 @@ EdgeAudioActive() {
     return false
 }
 
+; Returns an array of Maps: state (0 inactive, 1 active, 2 expired),
+; pid, name. Throws if the audio stack cannot be reached at all.
+EnumAudioSessions() {
+    sessions := []
+
+    ; MMDeviceEnumerator -> default render endpoint
+    enum := ComObject("{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+                    , "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+    ComCall(4, enum, "int", 0, "int", 1, "ptr*", &devPtr := 0)   ; GetDefaultAudioEndpoint(eRender, eMultimedia)
+    dev := ComValue(13, devPtr)
+
+    ; IMMDevice::Activate(IAudioSessionManager2)
+    iid := Buffer(16, 0)
+    DllCall("ole32\CLSIDFromString", "wstr", "{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}", "ptr", iid)
+    ComCall(3, dev, "ptr", iid, "uint", 0, "ptr", 0, "ptr*", &mgrPtr := 0)
+    mgr := ComValue(13, mgrPtr)
+
+    ComCall(5, mgr, "ptr*", &sePtr := 0)                        ; GetSessionEnumerator
+    se := ComValue(13, sePtr)
+    ComCall(3, se, "int*", &count := 0)                         ; GetCount
+
+    Loop count {
+        ComCall(4, se, "int", A_Index - 1, "ptr*", &scPtr := 0) ; GetSession
+        sc := ComValue(13, scPtr)
+
+        state := -1
+        ComCall(3, sc, "int*", &state)                          ; IAudioSessionControl::GetState
+
+        pid := 0, name := ""
+        try {
+            sc2 := ComObjQuery(sc, "{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}")
+            ComCall(14, sc2, "uint*", &pid)                     ; IAudioSessionControl2::GetProcessId
+            name := ProcessGetName(pid)
+        }
+        sessions.Push(Map("state", state, "pid", pid, "name", name))
+    }
+    return sessions
+}
+
 ; --- Pixels in the video area keep changing --------------------------
 ; The backstop for a video muted in the player. Samples a 4x4 grid
 ; inside the marked rectangle and compares against the previous second.
 RegionChanged(r) {
     static prev := ""
+    static N := 5
     sig := ""
-    Loop 4 {
+    Loop N {
         ix := A_Index
-        Loop 4 {
+        Loop N {
             iy := A_Index
-            x := Round(r[1] + (r[3] - r[1]) * (ix - 0.5) / 4)
-            y := Round(r[2] + (r[4] - r[2]) * (iy - 0.5) / 4)
+            x := Round(r[1] + (r[3] - r[1]) * (ix - 0.5) / N)
+            y := Round(r[2] + (r[4] - r[2]) * (iy - 0.5) / N)
             try sig .= PixelGetColor(x, y) "|"
         }
     }
@@ -436,21 +463,35 @@ ResetApp() {
         before := ResetToken()
         if (before != "") {
             TapZone("reset", false)                  ; try without moving the cursor
-            Sleep 350
-            if (ResetToken() != before) {
-                lastResetHow := "swap (no cursor)"
+            if (WaitForToken(before, 900)) {
+                lastResetHow := "swap (posted click)"
                 return
             }
             TapZone("reset", true)                   ; real click
-            Sleep 450
-            if (ResetToken() != before) {
-                lastResetHow := "swap"
+            if (WaitForToken(before, 1200)) {
+                lastResetHow := "swap (click)"
                 return
             }
         }
     }
 
     HardReload()
+}
+
+; The window title lags document.title by a few hundred milliseconds, so
+; poll rather than sleeping a fixed amount and guessing. Guessing short
+; makes the controller click twice, and the second click lands on a page
+; whose standby copy is already spent - which shows the loading screen,
+; the exact thing fast reset exists to avoid.
+WaitForToken(before, timeoutMs) {
+    t0 := A_TickCount
+    while (A_TickCount - t0 < timeoutMs) {
+        Sleep 50
+        now := ResetToken()
+        if (now != "" && now != before)
+            return true
+    }
+    return false
 }
 
 HardReload() {
@@ -557,6 +598,7 @@ BuildTrayMenu() {
     m := A_TrayMenu
     m.Delete()
     m.Add("Status", (*) => ShowStatus())
+    m.Add("Audio sessions", (*) => ShowAudioSessions())
     m.Add("Mark video area", (*) => MarkVideoArea())
     m.Add()
     m.Add("Reset app now", (*) => ResetApp())
@@ -588,6 +630,32 @@ ShowStatus() {
         . "  wrapper token:  " (tok != "" ? tok : "not visible - fast reset will fall back to reload") "`n"
         . "  last reset via: " lastResetHow
         , "Kiosk status", 0x40
+}
+
+; Start the video, then open this. It shows exactly what Windows reports,
+; which is the fastest way to find out why audio detection is quiet.
+ShowAudioSessions() {
+    txt := ""
+    try {
+        list := EnumAudioSessions()
+        if (list.Length = 0)
+            txt := "The default playback device reports no sessions at all.`n`n"
+                 . "Usually that means no application has opened an audio`n"
+                 . "stream since boot, or the device is not really the one`n"
+                 . "Edge is using."
+        for s in list {
+            txt .= (s["state"] = 1 ? "ACTIVE  " : s["state"] = 0 ? "idle    " : "expired ")
+                . (s["name"] != "" ? s["name"] : "pid " s["pid"] " (name unavailable)") "`n"
+        }
+    } catch as e {
+        txt := "Could not read the audio sessions:`n`n" e.Message
+             . "`n`nThe playback device may be missing or disabled."
+    }
+    MsgBox txt "`n`nWhat to look for: with the video playing there should`n"
+        . "be an ACTIVE msedge.exe line. If every Edge line is idle,`n"
+        . "the video is muted in the PLAYER - mute the Windows device`n"
+        . "instead, and use VideoRect as the backstop."
+        , "Kiosk - audio sessions", 0x40
 }
 
 MarkVideoArea() {
