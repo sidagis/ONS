@@ -5737,16 +5737,22 @@
 
       <div class="panelHeading"></div>
       <button class="kioskBtn data" data-action="fields">
-        <span class="btnTitle">Hydrocarbon locations</span>
+        <span class="btnTitle">Oil and Gas</span>
       </button>
       <button class="kioskBtn data" data-action="explorationwells">
         <span class="btnTitle">Ongoing exploration</span>
       </button>
       <button class="kioskBtn data" data-action="co2">
-        <span class="btnTitle">CO₂-storage licences</span>
+        <span class="btnTitle">CO₂ storage licences</span>
       </button>
       <button class="kioskBtn data" data-action="minerals">
         <span class="btnTitle">Sea bed minerals</span>
+      </button>
+      <button class="kioskBtn data" data-action="wind">
+        <span class="btnTitle">Assessed offshore wind areas</span>
+      </button>
+      <button class="kioskBtn data" data-action="transport">
+        <span class="btnTitle">Gas transport to Europe</span>
       </button>
     </div>
 
@@ -5772,6 +5778,8 @@
       // The always-on feature layer (portal layer id).
       alwaysOnFeatureLayerId: "19ee105df08-layer-119",
       graticuleLayerId: "19ee14e406f-layer-35",
+      windLayerId: "19ffa06bd20-layer-34",
+      TransportLayerId: "1a0146b7b3d-layer-34",
 
       // Sublayers that must ALWAYS be visible (FactMaps service sublayer ids).
       // 800 + its sublayers are pinned. We assert 800 and re-assert all its
@@ -5806,8 +5814,10 @@ window.addEventListener("contextmenu", function (e) {
       let initialViewpoint = null;    // home viewpoint
       let idleTimer = null;
       let graticuleLayer = null;
+      let windLayer = null;
       let defaultBasemap = null;
       let labelLayer = null;
+      let transportLayer = null;
       
 
       const extentCache = {};
@@ -5987,6 +5997,13 @@ window.addEventListener("contextmenu", function (e) {
         graticuleLayer = all.find(function (l) {
           return l.id === CONFIG.graticuleLayerId;
         }) || null;
+        windLayer = all.find(function (l) {
+          return l.id === CONFIG.windLayerId;
+        }) || null;
+
+        transportLayer = all.find(function (l) {
+          return l.id === CONFIG.TransportLayerId;
+        }) || null;        
 
         // Make sure the MapImageLayer and its sublayers are fully loaded so
         // findSublayerById works and sublayers collection is populated.
@@ -5994,6 +6011,8 @@ window.addEventListener("contextmenu", function (e) {
         if (factMapsLayer && factMapsLayer.load) waits.push(factMapsLayer.load());
         if (alwaysOnLayer && alwaysOnLayer.load) waits.push(alwaysOnLayer.load());
         if (graticuleLayer && graticuleLayer.load) waits.push(graticuleLayer.load());
+        if (windLayer && windLayer.load) waits.push(windLayer.load());
+        if (transportLayer && transportLayer.load) waits.push(transportLayer.load());
 
         return Promise.all(waits).catch(function (e) {
           console.warn("Layer load issue:", e);
@@ -6091,6 +6110,34 @@ window.addEventListener("contextmenu", function (e) {
         assertAlwaysOn();
       }
 
+
+      function resolveLayerExtent(layer) {
+        if (!layer) return Promise.resolve(null);
+        const key = "lyr:" + layer.id;
+        if (extentCache[key]) return Promise.resolve(extentCache[key]);
+
+        function done(ext) {
+          if (ext) extentCache[key] = ext;
+          return ext;
+        }
+        function fallback() {
+          return layer.fullExtent ? layer.fullExtent.expand(1.15) : null;
+        }
+
+        if (layer.queryExtent) {
+          return layer.queryExtent().then(function (res) {
+            const ext = (res && res.extent) ? res.extent.expand(1.15) : fallback();
+            return done(ext);
+          }).catch(function () { return done(fallback()); });
+        }
+        return Promise.resolve(done(fallback()));
+      }
+
+      function goToLayerExtent(layer) {
+        return resolveLayerExtent(layer).then(function (ext) {
+          if (ext) return view.goTo(ext, { duration: 900 }).catch(function () { });
+        });
+      }
 
       function goToExtent(extObj, animate) {
         const ext = new Extent({
@@ -6201,6 +6248,40 @@ window.addEventListener("contextmenu", function (e) {
           assertAlwaysOn();
           return goToSublayerExtent(626);
         },
+
+        wind: function () {
+          resetToDefaults();
+          allTopLayersOff();
+          allSublayersOff();
+          labelLayer.visible = false;
+          assertAlwaysOn();
+           windLayer.visible = true;
+          if (windLayer.parent && windLayer.parent.visible === false) {
+            windLayer.parent.visible = true;
+          }
+
+          return goToLayerExtent(windLayer);
+        },
+
+        transport: function () {
+          resetToDefaults();
+          allTopLayersOff();
+          allSublayersOff();
+          labelLayer.visible = false;          
+          setSublayerVisible(500, true);
+          setSublayerVisible(502, true);
+          setSublayerVisible(300, true);
+          setSublayerVisible(304, false);
+          setSublayerVisible(307, false);
+          setSublayerVisible(503, true);
+          assertAlwaysOn();
+           transportLayer.visible = true;
+          if (transportLayer.parent && transportLayer.parent.visible === false) {
+            transportLayer.parent.visible = true;
+          }
+
+          return goToLayerExtent(transportLayer);
+        },        
 
         minerals: function () {
           resetToDefaults();
