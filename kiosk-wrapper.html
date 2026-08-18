@@ -51,6 +51,12 @@
   @media (prefers-reduced-motion:reduce){.ring{animation:none}}
   #veil p{margin:0;font-size:clamp(1rem,1.5vw,1.4rem);letter-spacing:.01em;color:var(--dim);max-width:32ch;line-height:1.5;}
 
+  /* Acknowledgement marker. The controller reads this pixel to confirm
+     its click landed, because the window title turns out not to follow
+     document.title in kiosk fullscreen. Two near-black shades: readable
+     to PixelGetColor, invisible on screen. */
+  #ack{position:fixed;left:0;bottom:0;width:6px;height:6px;z-index:40;background:#101010;pointer-events:none;}
+
   #dbg{
     position:fixed;left:0;bottom:0;z-index:30;display:none;
     padding:.45rem .7rem;background:rgba(0,0,0,.7);color:#6f6;
@@ -72,6 +78,7 @@
   <p id="veilmsg">Loading the map</p>
 </div>
 
+<div id="ack"></div>
 <div id="dbg"></div>
 
 <!-- Generated from kiosk.ini every time kiosk-lock.ahk starts. -->
@@ -118,6 +125,17 @@
   const veil  = document.getElementById("veil");
   const msg   = document.getElementById("veilmsg");
   const dbg   = document.getElementById("dbg");
+  const ackEl = document.getElementById("ack");
+
+  // Randomised so that even a full page reload usually flips the marker,
+  // which lets the controller notice a reload it did not ask for.
+  let ackOn = Math.random() < 0.5;
+  const ACK_COLOURS = ["#101010", "#303030"];
+
+  function ack() {
+    ackOn = !ackOn;
+    ackEl.style.background = ACK_COLOURS[ackOn ? 1 : 0];
+  }
 
   const DEBUG = new URLSearchParams(location.search).has("debug");
   if (DEBUG) dbg.dataset.on = "1";
@@ -244,7 +262,8 @@
 
   function onResetTrigger() {
     trigCount++;
-    publish();                                   // acknowledge instantly
+    ack();                                       // acknowledge instantly
+    publish();
     if (Date.now() - lastResetAt < RESET_LOCK_MS) return;   // duplicate click
     lastResetAt = Date.now();
     reset();
@@ -290,11 +309,13 @@
         "\nstandby:   " + warmState + (warmState === "ready" ? (warmUsable() ? " (usable)" : " (settling)") : "") +
         "\nresets:    " + resetCount + "  (triggers " + trigCount + ")" +
         "\nfast:      " + CONFIG.fastReset +
+        "\nack pixel: " + ackEl.style.background +
         "\ntitle:     " + document.title;
     }, 500);
   }
 
   /* ---------- go ---------- */
+  ackEl.style.background = ACK_COLOURS[ackOn ? 1 : 0];
   publish();
   coldLoad();
 })();

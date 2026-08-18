@@ -460,43 +460,85 @@ ResetApp() {
     global CFG, USES_WRAPPER, lastResetHow
 
     if (CFG["FastReset"] && USES_WRAPPER) {
-        before := ResetToken()
-        if (before != "") {
+        tokBefore := ResetToken()
+        pixBefore := AckPixel()
+        if (tokBefore != "" || pixBefore != "") {
             TapZone("reset", false)                  ; try without moving the cursor
-            if (WaitForToken(before, 900)) {
+            if (WaitForAck(tokBefore, pixBefore, 900)) {
                 lastResetHow := "swap (posted click)"
                 return
             }
             TapZone("reset", true)                   ; real click
-            if (WaitForToken(before, 1200)) {
+            if (WaitForAck(tokBefore, pixBefore, 1200)) {
                 lastResetHow := "swap (click)"
                 return
             }
+            lastResetHow := "reload (no acknowledgement)"
+            LogLine("fast reset was not acknowledged - falling back to reload")
         }
     }
 
     HardReload()
 }
 
-; The window title lags document.title by a few hundred milliseconds, so
-; poll rather than sleeping a fixed amount and guessing. Guessing short
-; makes the controller click twice, and the second click lands on a page
-; whose standby copy is already spent - which shows the loading screen,
-; the exact thing fast reset exists to avoid.
-WaitForToken(before, timeoutMs) {
+; Two independent acknowledgement channels, because either one alone can
+; be unreliable: Chromium in kiosk fullscreen does not always push
+; document.title into the window text, and a posted click is not always
+; honoured. Any change in either means the click landed.
+WaitForAck(tokBefore, pixBefore, timeoutMs) {
     t0 := A_TickCount
     while (A_TickCount - t0 < timeoutMs) {
-        Sleep 50
-        now := ResetToken()
-        if (now != "" && now != before)
+        Sleep 40
+        t := ResetToken()
+        if (t != "" && t != tokBefore)
+            return true
+        p := AckPixel()
+        if (p != "" && p != pixBefore)
             return true
     }
     return false
 }
 
+; The wrapper flips a 6px marker in the bottom-left corner on every
+; trigger. Reading a pixel is not subject to any of the window-text
+; quirks, so this is the channel that actually carries the answer.
+AckPixel() {
+    hwnd := KioskWindow()
+    if (!hwnd)
+        return ""
+    try {
+        WinGetPos &wx, &wy, &ww, &wh, hwnd
+        return PixelGetColor(wx + 3, wy + wh - 4)
+    }
+    return ""
+}
+
+; WinExist("ahk_exe msedge.exe") can return one of Edge's hidden helper
+; windows, whose title never changes. Pick the largest visible one.
+KioskWindow() {
+    static cached := 0
+    if (cached && WinExist("ahk_id " cached))
+        return cached
+
+    best := 0, bestArea := 0
+    try {
+        for h in WinGetList("ahk_exe msedge.exe") {
+            try WinGetPos &x, &y, &w, &ht, h
+            catch
+                continue
+            if (w * ht > bestArea) {
+                bestArea := w * ht
+                best := h
+            }
+        }
+    }
+    cached := best
+    return best
+}
+
 HardReload() {
     global lastResetHow
-    hwnd := WinExist("ahk_exe msedge.exe")
+    hwnd := KioskWindow()
     if (!hwnd)
         return
     try {
@@ -511,7 +553,7 @@ HardReload() {
 ; Reads the token the wrapper publishes in its title, e.g. "Kiosk|r7f3a-2".
 ResetToken() {
     try {
-        if (hwnd := WinExist("ahk_exe msedge.exe")) {
+        if (hwnd := KioskWindow()) {
             t := WinGetTitle(hwnd)
             if RegExMatch(t, "\|r([^|]+)", &m)
                 return m[1]
@@ -522,7 +564,7 @@ ResetToken() {
 
 ; which = "reset" (top-left) or "warm" (top-right)
 TapZone(which, realClick := true) {
-    hwnd := WinExist("ahk_exe msedge.exe")
+    hwnd := KioskWindow()
     if (!hwnd)
         return
     try {
@@ -627,7 +669,8 @@ ShowStatus() {
         . "  hold ceiling:   " CFG["MaxHoldSeconds"] " s`n`n"
         . "RESET`n"
         . "  fast reset:     " (CFG["FastReset"] && USES_WRAPPER ? "on" : "off") "`n"
-        . "  wrapper token:  " (tok != "" ? tok : "not visible - fast reset will fall back to reload") "`n"
+        . "  ack pixel:      " (AckPixel() != "" ? AckPixel() " (this is what confirms a swap)" : "unreadable") "`n"
+        . "  wrapper token:  " (tok != "" ? tok : "not visible (harmless, the pixel is the real channel)") "`n"
         . "  last reset via: " lastResetHow
         , "Kiosk status", 0x40
 }
