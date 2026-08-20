@@ -506,6 +506,52 @@ MotionSummary() {
     return motionPct "% sustained -> " (motionPlaying ? "PLAYING" : "not a video")
 }
 
+; =====================================================================
+;  Audio output mute
+; =====================================================================
+; Mutes the default playback device. Deliberately mutes the DEVICE, not
+; the video, so EdgeAudioActive() keeps working: Edge goes on producing
+; the stream and Windows discards it.
+MuteOutput() {
+    try {
+        enum := ComObject("{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+                        , "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+        ComCall(4, enum, "int", 0, "int", 1, "ptr*", &devPtr := 0)
+        dev := ComValue(13, devPtr)
+
+        iid := Buffer(16, 0)
+        DllCall("ole32\CLSIDFromString", "wstr", "{5CDF2C82-841E-4546-9722-0CF74078229A}", "ptr", iid)   ; IAudioEndpointVolume
+        ComCall(3, dev, "ptr", iid, "uint", 0, "ptr", 0, "ptr*", &volPtr := 0)
+        vol := ComValue(13, volPtr)
+
+        ComCall(14, vol, "int", 1, "ptr", 0)      ; SetMute(TRUE, NULL)
+        LogLine("playback device muted")
+        return true
+    } catch as e {
+        LogLine("could not mute the playback device: " e.Message)
+        return false
+    }
+}
+
+OutputIsMuted() {
+    try {
+        enum := ComObject("{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+                        , "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+        ComCall(4, enum, "int", 0, "int", 1, "ptr*", &devPtr := 0)
+        dev := ComValue(13, devPtr)
+        iid := Buffer(16, 0)
+        DllCall("ole32\CLSIDFromString", "wstr", "{5CDF2C82-841E-4546-9722-0CF74078229A}", "ptr", iid)
+        ComCall(3, dev, "ptr", iid, "uint", 0, "ptr", 0, "ptr*", &volPtr := 0)
+        vol := ComValue(13, volPtr)
+        ComCall(15, vol, "int*", &muted := 0)     ; GetMute
+        return muted ? "muted" : "NOT muted"
+    }
+    return "unknown"
+}
+
+; =====================================================================
+;  Reset
+; =====================================================================
 ResetApp() {
     global CFG, USES_WRAPPER, lastResetHow
 
@@ -732,7 +778,7 @@ ShowStatus() {
         . "  hold ceiling:   " CFG["MaxHoldSeconds"] " s`n`n"
         . "RESET`n"
         . "  fast reset:     " (CFG["FastReset"] && USES_WRAPPER ? "on" : "off")
-                                (CFG["FastReset"] && USES_WRAPPER && !CFG["ResetFallback"] ? ", unverified (no reload fallback)" : "") "`n"
+        . (CFG["FastReset"] && USES_WRAPPER && !CFG["ResetFallback"] ? ", unverified (no reload fallback)" : "") "`n"
         . "  visitor since:  " (inputSinceReset ? "yes - a reset is due when idle" : "no - already on the front page") "`n"
         . "  ack pixel:      " (AckPixel() != "" ? AckPixel() " (this is what confirms a swap)" : "unreadable") "`n"
         . "  wrapper token:  " (tok != "" ? tok : "not visible (harmless, the pixel is the real channel)") "`n"
