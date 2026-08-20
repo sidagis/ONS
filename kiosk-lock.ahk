@@ -121,6 +121,7 @@ LoadConfig() {
     c["FastReset"]           := NumOr(IniRead(INI, "Kiosk", "FastReset", 1), 1)
     c["PrewarmSeconds"]      := NumOr(IniRead(INI, "Kiosk", "PrewarmSeconds", 12), 12)
     c["ResetFallback"]       := NumOr(IniRead(INI, "Kiosk", "ResetFallback", 0), 0)
+    c["WrapperDebug"]        := NumOr(IniRead(INI, "Kiosk", "WrapperDebug", 0), 0)
     c["IdleReloadMinutes"]   := NumOr(IniRead(INI, "Kiosk", "IdleReloadMinutes", 30), 30)
 
     if (c["IdleSeconds"] < 5)                          ; a typo must not brick the kiosk
@@ -181,7 +182,10 @@ BuildStartUrl() {
         return CFG["StartUrl"]
     if (USES_WRAPPER) {
         WriteWrapperConfig()
-        return "file:///" StrReplace(A_ScriptDir "\kiosk-wrapper.html", "\", "/")
+        u := "file:///" StrReplace(A_ScriptDir "\kiosk-wrapper.html", "\", "/")
+        ; Debug overlay without giving up fast reset, which setting
+        ; StartUrl by hand would do.
+        return CFG["WrapperDebug"] ? u "?debug=1" : u
     }
     return CFG["AppUrl"]
 }
@@ -297,17 +301,25 @@ IdleWatch() {
 
     idle := IdleMs()
 
+    ; Start loading the standby copy shortly before the reset is due - but
+    ; never while a video is playing. A second copy of the Experience means
+    ; a second video player, and Vimeo pauses one player when another
+    ; starts; two live instances can also push Chromium into dropping the
+    ; visible frame. Either way the video stops and the page does not
+    ; change, which looks like a broken reset.
+    ;
+    ; This sits outside the idle branch on purpose, so that when a long
+    ; video finally ends the prewarm can still start during the hold, using
+    ; PostVideoSeconds as its head start.
+    if (CFG["FastReset"] && USES_WRAPPER && !warmSent && inputSinceReset
+        && why = ""
+        && idle >= (CFG["IdleSeconds"] - CFG["PrewarmSeconds"]) * 1000) {
+        warmSent := true
+        TapZone("warm", false)        ; posted click only - never move the cursor
+    }
+
     if (idle < CFG["IdleSeconds"] * 1000) {
         fired := false
-
-        ; Start loading the standby copy shortly before the reset is due,
-        ; so the swap is instant when it happens. Only worth doing if
-        ; somebody has actually used the app since the last reset.
-        if (CFG["FastReset"] && USES_WRAPPER && !warmSent && inputSinceReset
-            && idle >= (CFG["IdleSeconds"] - CFG["PrewarmSeconds"]) * 1000) {
-            warmSent := true
-            TapZone("warm", false)        ; posted click only - never move the cursor
-        }
         return
     }
 
@@ -776,7 +788,7 @@ BuildTrayMenu() {
 }
 
 ShowStatus() {
-    global CFG, mediaLastSeen, mediaWhy, lastResetHow, USES_WRAPPER, inputSinceReset
+    global CFG, mediaLastSeen, mediaWhy, lastResetHow, USES_WRAPPER, inputSinceReset, warmSent
     live := DetectVideo()
     ago := mediaLastSeen ? Round((A_TickCount - mediaLastSeen) / 1000) " s ago" : "never"
     tok := ResetToken()
@@ -794,6 +806,8 @@ ShowStatus() {
         . "  fast reset:     " (CFG["FastReset"] && USES_WRAPPER ? "on" : "off")
         . (CFG["FastReset"] && USES_WRAPPER && !CFG["ResetFallback"] ? ", unverified (no reload fallback)" : "") "`n"
         . "  visitor since:  " (inputSinceReset ? "yes - a reset is due when idle" : "no - already on the front page") "`n"
+        . "  standby copy:   " (!CFG["FastReset"] || !USES_WRAPPER ? "not used"
+                              : warmSent ? "requested" : live != "" ? "held back - video playing" : "not requested yet") "`n"
         . "  ack pixel:      " (AckPixel() != "" ? AckPixel() " (this is what confirms a swap)" : "unreadable") "`n"
         . "  wrapper token:  " (tok != "" ? tok : "not visible (harmless, the pixel is the real channel)") "`n"
         . "  last reset via: " lastResetHow
