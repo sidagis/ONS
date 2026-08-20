@@ -46,6 +46,12 @@ global warmSent := false
 global inputSinceReset := false    ; has a visitor touched it since the last reset
 global houseKept := false
 
+global motionPrev := ""            ; previous pixel sample of the video area
+global motionHist := []            ; rolling record of which samples changed
+global motionPlaying := false
+global motionPct := 0
+global meterUntil := 0
+
 global EDGE_EXE := FindEdge()
 if (EDGE_EXE = "") {
     MsgBox "Microsoft Edge could not be found.`n`nInstall Edge, or set EdgeExe= in kiosk.ini to the full path of msedge.exe.", "Kiosk", 0x10
@@ -76,6 +82,7 @@ if (CFG["BlockAllKeys"])
 
 SetTimer IdleWatch, 1000
 SetTimer EdgeWatch, 3000
+SetTimer MotionTick, CFG["MotionSampleMs"]
 
 BuildTrayMenu()
 return
@@ -104,6 +111,10 @@ LoadConfig() {
     c["MuteOutput"]          := NumOr(IniRead(INI, "Kiosk", "MuteOutput", 1), 1)
     c["DisableVideoOverlay"] := NumOr(IniRead(INI, "Kiosk", "DisableVideoOverlay", 1), 1)
     c["VideoRect"]           := Trim(IniRead(INI, "Kiosk", "VideoRect", ""))
+    c["MotionSampleMs"]      := NumOr(IniRead(INI, "Kiosk", "MotionSampleMs", 250), 250)
+    c["MotionWindowMs"]      := NumOr(IniRead(INI, "Kiosk", "MotionWindowMs", 3000), 3000)
+    c["MotionSustainPercent"]:= NumOr(IniRead(INI, "Kiosk", "MotionSustainPercent", 70), 70)
+    c["MotionPointsPercent"] := NumOr(IniRead(INI, "Kiosk", "MotionPointsPercent", 15), 15)
     c["MaxHoldSeconds"]      := NumOr(IniRead(INI, "Kiosk", "MaxHoldSeconds", 180), 180)
     c["PostVideoSeconds"]    := NumOr(IniRead(INI, "Kiosk", "PostVideoSeconds", 20), 20)
 
@@ -322,10 +333,10 @@ IdleWatch() {
 
 ; Returns the name of whichever detector saw a video, or "".
 DetectVideo() {
-    global CFG
+    global CFG, motionPlaying
     if (CFG["HoldForAudio"] && EdgeAudioActive())
         return "Edge audio"
-    if (CFG["Rect"] != "" && RegionChanged(CFG["Rect"]))
+    if (CFG["Rect"] != "" && motionPlaying)
         return "screen motion"
     return ""
 }
@@ -404,83 +415,97 @@ EnumAudioSessions() {
 }
 
 ; --- Pixels in the video area keep changing --------------------------
-; The backstop for a video muted in the player. Samples a 4x4 grid
-; inside the marked rectangle and compares against the previous second.
-RegionChanged(r) {
-    static prev := ""
-    static N := 5
-    sig := ""
+; The backstop for a video muted in the player.
+;
+; The hard part is telling a video apart from a rotating image banner,
+; which also changes pixels and may sit in or beside the same area. What
+; separates them is not whether the pixels change but how CONSTANTLY:
+;
+;   a video      changes on essentially every frame, all the time
+;   a carousel   changes for a moment, then holds still for seconds
+;
+; So the area is sampled several times a second and a rolling window of
+; recent comparisons is kept. Playback is declared only when most of that
+; window shows change. A banner rotating every few seconds scores maybe
+; 20-30%; a video scores close to 100%.
+;
+; Sampling only runs in the seconds around the reset deadline, so it
+; costs nothing while somebody is actually using the kiosk.
+
+MotionTick() {
+    global CFG, motionPrev, motionHist, motionPlaying, motionPct, meterUntil
+
+    r := CFG["Rect"]
+    if (r = "")
+        return
+
+    ; Only sample when a decision is close, with enough lead time to fill
+    ; the window first - unless the tuning meter is running.
+    lead := CFG["MotionWindowMs"] + 3000
+    if (A_TickCount > meterUntil && IdleMs() < CFG["IdleSeconds"] * 1000 - lead) {
+        if (motionHist.Length) {
+            motionHist := []
+            motionPrev := ""
+            motionPlaying := false
+            motionPct := 0
+        }
+        return
+    }
+
+    sig := []
+    N := 4
     Loop N {
         ix := A_Index
         Loop N {
             iy := A_Index
             x := Round(r[1] + (r[3] - r[1]) * (ix - 0.5) / N)
             y := Round(r[2] + (r[4] - r[2]) * (iy - 0.5) / N)
-            try sig .= PixelGetColor(x, y) "|"
+            try sig.Push(PixelGetColor(x, y))
+            catch
+                sig.Push(0)
         }
     }
-    changed := (prev != "" && sig != "" && sig != prev)
-    prev := sig
-    return changed
-}
 
-; =====================================================================
-;  Audio output mute
-; =====================================================================
-; Mutes the default playback device. Deliberately mutes the DEVICE, not
-; the video, so EdgeAudioActive() keeps working.
-MuteOutput() {
-    try {
-        enum := ComObject("{BCDE0395-E52F-467C-8E3D-C4579291692E}"
-                        , "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
-        ComCall(4, enum, "int", 0, "int", 1, "ptr*", &devPtr := 0)
-        dev := ComValue(13, devPtr)
+    if (motionPrev != "" && motionPrev.Length = sig.Length) {
+        moved := 0
+        Loop sig.Length
+            if (sig[A_Index] != motionPrev[A_Index])
+                moved++
 
-        iid := Buffer(16, 0)
-        DllCall("ole32\CLSIDFromString", "wstr", "{5CDF2C82-841E-4546-9722-0CF74078229A}", "ptr", iid)   ; IAudioEndpointVolume
-        ComCall(3, dev, "ptr", iid, "uint", 0, "ptr", 0, "ptr*", &volPtr := 0)
-        vol := ComValue(13, volPtr)
+        ; A frame counts as "moving" only if a fair share of the sample
+        ; points changed - a single flickering pixel is not a video.
+        movingFrame := (moved * 100 / sig.Length) >= CFG["MotionPointsPercent"]
+        motionHist.Push(movingFrame ? 1 : 0)
 
-        ComCall(14, vol, "int", 1, "ptr", 0)      ; SetMute(TRUE, NULL)
-        LogLine("playback device muted")
-        return true
-    } catch as e {
-        LogLine("could not mute the playback device: " e.Message)
-        return false
+        cap := Max(4, Round(CFG["MotionWindowMs"] / CFG["MotionSampleMs"]))
+        while (motionHist.Length > cap)
+            motionHist.RemoveAt(1)
+
+        if (motionHist.Length >= cap) {
+            hits := 0
+            for v in motionHist
+                hits += v
+            motionPct := Round(hits * 100 / motionHist.Length)
+
+            ; Hysteresis: harder to start than to keep going, so a quiet
+            ; passage in the video does not drop the hold.
+            enter := CFG["MotionSustainPercent"]
+            leave := Max(20, enter // 2)
+            motionPlaying := motionPlaying ? (motionPct >= leave) : (motionPct >= enter)
+        }
     }
+    motionPrev := sig
 }
 
-OutputIsMuted() {
-    try {
-        enum := ComObject("{BCDE0395-E52F-467C-8E3D-C4579291692E}"
-                        , "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
-        ComCall(4, enum, "int", 0, "int", 1, "ptr*", &devPtr := 0)
-        dev := ComValue(13, devPtr)
-        iid := Buffer(16, 0)
-        DllCall("ole32\CLSIDFromString", "wstr", "{5CDF2C82-841E-4546-9722-0CF74078229A}", "ptr", iid)
-        ComCall(3, dev, "ptr", iid, "uint", 0, "ptr", 0, "ptr*", &volPtr := 0)
-        vol := ComValue(13, volPtr)
-        ComCall(15, vol, "int*", &muted := 0)     ; GetMute
-        return muted ? "muted" : "NOT muted"
-    }
-    return "unknown"
+MotionSummary() {
+    global CFG, motionPlaying, motionPct, motionHist
+    if (CFG["Rect"] = "")
+        return "off, no VideoRect set"
+    if (motionHist.Length = 0)
+        return "idle, sampling starts near the reset deadline"
+    return motionPct "% sustained -> " (motionPlaying ? "PLAYING" : "not a video")
 }
 
-; =====================================================================
-;  Reset
-; =====================================================================
-; Fast path: the wrapper keeps a second, already-loaded copy of the app
-; behind the visible one. Tapping a small zone in the top-left corner
-; makes it swap, which is instant and shows no loading screen.
-;
-; The tap has to be a mouse click, because that is the one kind of input
-; the wrapper can tell apart from a visitor's finger - so a stray touch
-; in the corner cannot trigger a reset.
-;
-; The wrapper puts a token in its title, which is the Edge window title.
-; If the token does not change, the swap did not happen and we fall back
-; to a plain reload. So if any part of this fails, the kiosk still
-; resets correctly, just with the loading screen.
 ResetApp() {
     global CFG, USES_WRAPPER, lastResetHow
 
@@ -676,6 +701,7 @@ BuildTrayMenu() {
     m := A_TrayMenu
     m.Delete()
     m.Add("Status", (*) => ShowStatus())
+    m.Add("Motion meter (30s)", (*) => MotionMeter())
     m.Add("Audio sessions", (*) => ShowAudioSessions())
     m.Add("Mark video area", (*) => MarkVideoArea())
     m.Add()
@@ -699,7 +725,7 @@ ShowStatus() {
         . "  right now:      " (live = "" ? "nothing detected" : "detected by " live) "`n"
         . "  last detected:  " ago (mediaWhy != "" ? " (" mediaWhy ")" : "") "`n"
         . "  Edge audio:     " (CFG["HoldForAudio"] ? (EdgeAudioActive() ? "PLAYING" : "quiet") : "off") "`n"
-        . "  screen motion:  " (CFG["Rect"] != "" ? "watching " CFG["VideoRect"] : "off, no VideoRect set") "`n"
+        . "  screen motion:  " MotionSummary() "`n"
         . "  output device:  " OutputIsMuted() "`n`n"
         . "IDLE`n"
         . "  now:            " Round(IdleMs() / 1000) " s of " CFG["IdleSeconds"] " s`n"
@@ -738,6 +764,40 @@ ShowAudioSessions() {
         . "the video is muted in the PLAYER - mute the Windows device`n"
         . "instead, and use VideoRect as the backstop."
         , "Kiosk - audio sessions", 0x40
+}
+
+; Live read-out for tuning MotionSustainPercent. Run it once with the
+; video playing and once with only the image banner rotating, and put the
+; threshold between the two numbers. Sampling is forced on for the
+; duration, so the idle deadline does not have to be near.
+MotionMeter() {
+    global CFG, motionPct, motionPlaying, motionHist, meterUntil
+
+    if (CFG["Rect"] = "") {
+        MsgBox "No VideoRect is set yet.`n`nUse 'Mark video area' first.", "Kiosk", 0x30
+        return
+    }
+
+    meterUntil := A_TickCount + 30000
+    motionHist := []
+    SetTimer MeterTick, 250
+}
+
+MeterTick() {
+    global CFG, motionPct, motionPlaying, meterUntil
+    if (A_TickCount > meterUntil) {
+        SetTimer MeterTick, 0
+        ToolTip
+        return
+    }
+    left := Round((meterUntil - A_TickCount) / 1000)
+    ToolTip "Motion in " CFG["VideoRect"] "`n`n"
+          . motionPct "% sustained`n"
+          . "verdict: " (motionPlaying ? "PLAYING - reset held" : "not a video - reset allowed") "`n"
+          . "threshold: " CFG["MotionSustainPercent"] "%`n`n"
+          . "A video reads near 100%. A rotating banner reads low.`n"
+          . "closing in " left "s"
+          , 20, 20
 }
 
 MarkVideoArea() {

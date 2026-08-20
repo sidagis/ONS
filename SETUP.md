@@ -64,7 +64,20 @@ Two consequences worth planning for. Your Vimeo embed must not be set to muted a
 
 To set the rectangle: put `BlockMouseButtons=0` in `kiosk.ini` temporarily, start the kiosk, right-click the tray icon → **Mark video area**, then tap the two opposite corners of the video. It saves to `kiosk.ini` and takes effect immediately. Set `BlockMouseButtons` back to `1` afterwards.
 
-Keep the rectangle inside the video. Point it at the map and an animated layer or a spinning progress indicator will hold the reset forever — well, until the ceiling.
+**Telling a video apart from a rotating image banner.** Anything that animates changes pixels, so change alone isn't enough — a carousel cycling three or four images reads the same as a video to a naive detector, and holds the reset until the ceiling. What separates them is how *constant* the change is:
+
+| | |
+|---|---|
+| A video | changes on essentially every frame, continuously |
+| A carousel | changes for a moment, then holds still for seconds |
+
+So the area is sampled four times a second and a rolling three-second window records which samples changed. Playback is declared only when at least `MotionSustainPercent` (default 70%) of that window shows change. A video reads close to 100%; a banner rotating every few seconds reads 20–30%. There's hysteresis on the way out, so a still passage in the video doesn't drop the hold.
+
+To tune it against your own content: tray icon → **Motion meter (30s)**. Run it once with the video playing and once with only the banner rotating, then set `MotionSustainPercent` between the two readings. If the banner ever scores close to the video — a continuous cross-fade rather than a cut — move the rectangle so it excludes the banner, or lean on audio detection instead.
+
+Sampling only runs in the seconds around the reset deadline, so it costs nothing while somebody is using the kiosk.
+
+Keep the rectangle inside the video. Point it at the map and an animated layer or a spinning progress indicator will hold the reset until the ceiling.
 
 **The ceiling.** `MaxHoldSeconds` (default 180) is measured from the last real touch, and nothing holds the reset past it. So the worst case with a stuck detector is a kiosk that resets three minutes late, not one that never resets. Longest video plus about a minute; for 2 minutes, 180.
 
@@ -114,7 +127,7 @@ Add `?debug=1` to the wrapper URL (temporarily set `StartUrl=file:///C:/Kiosk/ki
 |---|---|
 | Resets while someone is using it | `IdleSeconds` too low, or the app is same-origin and both timers are running short |
 | Resets during the video | No detector firing. Tray icon → **Status**: is the video muted in the *player* rather than the device, and is `VideoRect` unset? |
-| Never resets after the video | A detector stuck on — usually a `VideoRect` covering something animated. `MaxHoldSeconds` caps the damage |
+| Never resets after the video | A detector stuck on — usually a `VideoRect` covering something animated. Tray → **Motion meter** to see its score, then raise `MotionSustainPercent`. `MaxHoldSeconds` caps the damage meanwhile |
 | Instant reset, then a loading screen | The swap wasn't acknowledged so the fallback reloaded. Set `ResetFallback=0` |
 | Reset still shows the loading screen | The standby copy wasn't ready. Raise `PrewarmSeconds` |
 | Mouse pointer parked in a corner | A real click was needed because the posted one was ignored. It hides again on the next touch |
