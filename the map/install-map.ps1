@@ -1,37 +1,43 @@
 <#
     install-map.ps1
     =====================================================================
-    ONS map touch kiosk. No AutoHotkey, no ini file.
+    ONS map touch kiosk - single self-contained installer.
+    No AutoHotkey, no ini file, no companion files in the repo:
+    everything it needs is generated at install time.
+
+    Fetched and run by install-map.cmd.
 
     THE IMPORTANT ARCHITECTURAL POINT
       A scheduled task running as SYSTEM lives in session 0 and cannot
-      draw on the interactive desktop. If you launch Edge from there it
-      starts, finds no desktop, and exits immediately - a black flash
-      and back to Windows. So the work is split:
+      draw on the interactive desktop. Launching Edge from there gives
+      a black flash and an immediate exit. So the work is split:
 
         start-map.vbs   runs as the signed-in user, in their session.
                         Triggers the lock task, launches Edge, waits
                         for it to close, triggers the unlock task.
 
-        kiosk-lock.ps1  runs as SYSTEM via scheduled task. Only touches
-                        the registry, services and power settings.
-                        Never launches anything with a window.
+        kiosk-lock.ps1  runs as SYSTEM via scheduled task. Registry,
+                        services and power only. Never opens a window.
 
     WHAT GETS INSTALLED (default C:\Kiosk\map)
-        start-map.vbs      user-session launcher
-        kiosk-lock.ps1     lock / unlock, SYSTEM
-        serve-mirror.ps1   local fallback web server
+        start-map.vbs      user-session launcher      (generated)
+        kiosk-lock.ps1     lock / unlock, SYSTEM      (generated)
+        serve-mirror.ps1   local fallback server      (generated)
         mirror\theMap.html last-known-good copy, refreshed every launch
+        kiosk.log          what happened, in order
 
     DESKTOP ICONS
         ONS Map            start the kiosk
         Restore Desktop    manual unlock if a session was interrupted
 
-    RUN AS ADMINISTRATOR:
-        powershell -ExecutionPolicy Bypass -File .\install-map.ps1
+    OPTIONS
+        -AutoStart     also launch at logon (recommended for a dedicated
+                       device: an overnight reboot brings the map back
+                       with nobody crawling behind the screen)
+        -NoFallback    skip the local mirror entirely
+        -Uninstall     remove everything and restore the PC
 
-    UNINSTALL:
-        powershell -ExecutionPolicy Bypass -File .\install-map.ps1 -Uninstall
+    Run as Administrator.
 #>
 
 [CmdletBinding()]
@@ -43,6 +49,7 @@ param(
     [int]   $Port       = 8731,
     [string]$TaskLock   = "ONS Map Lock",
     [string]$TaskUnlock = "ONS Map Unlock",
+    [switch]$AutoStart,
     [switch]$NoFallback,
     [switch]$Uninstall
 )
@@ -58,8 +65,10 @@ function Step { param($m) Write-Host "  [+] $m" -ForegroundColor Cyan }
 function Warn { param($m) Write-Host "  [!] $m" -ForegroundColor Yellow }
 
 $desk       = Join-Path $env:PUBLIC "Desktop"
+$startupDir = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\StartUp"
 $lnkStart   = Join-Path $desk "ONS Map.lnk"
 $lnkRestore = Join-Path $desk "Restore Desktop.lnk"
+$lnkAuto    = Join-Path $startupDir "ONS Map.lnk"
 
 # =====================================================================
 #  UNINSTALL
@@ -80,7 +89,7 @@ if ($Uninstall) {
     netsh http delete urlacl url="http://127.0.0.1:$Port/" 2>$null | Out-Null
     netsh advfirewall firewall delete rule name="ONS map local mirror" 2>$null | Out-Null
 
-    Remove-Item $lnkStart, $lnkRestore -Force -ErrorAction SilentlyContinue
+    Remove-Item $lnkStart, $lnkRestore, $lnkAuto -Force -ErrorAction SilentlyContinue
     Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
     Step "Files and icons removed"
     Write-Host "`n  Done. Reboot to be certain nothing is left applied.`n" -ForegroundColor Green
@@ -91,9 +100,9 @@ Write-Host "`n=== ONS map kiosk - install ===" -ForegroundColor Green
 Write-Host "  URL: $Url`n"
 
 # ---------------------------------------------------------------------
-#  CLEAN UP THE PREVIOUS ATTEMPT
-#  The old toggle-edition script left a scheduled task that launches
-#  Edge as SYSTEM. If it is still registered it will keep failing.
+#  CLEAN UP EARLIER ATTEMPTS
+#  The old toggle edition left a task that launches Edge as SYSTEM.
+#  If it is still registered it will keep failing.
 # ---------------------------------------------------------------------
 foreach ($old in @("ONS Kiosk Session", "ONS Kiosk Session Revert")) {
     if (Get-ScheduledTask -TaskName $old -ErrorAction SilentlyContinue) {
@@ -101,10 +110,8 @@ foreach ($old in @("ONS Kiosk Session", "ONS Kiosk Session Revert")) {
         Step "Removed old task '$old'"
     }
 }
-$oldSession = "C:\Kiosk\Kiosk-Session.ps1"
-if (Test-Path $oldSession) {
-    Remove-Item $oldSession, "C:\Kiosk\Resolve-MapUrl.ps1", "C:\Kiosk\kiosk-url.txt" -Force -ErrorAction SilentlyContinue
-    Step "Removed old session scripts"
+foreach ($f in @("C:\Kiosk\Kiosk-Session.ps1","C:\Kiosk\Resolve-MapUrl.ps1","C:\Kiosk\kiosk-url.txt")) {
+    if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue; Step "Removed stale $f" }
 }
 
 # ---------------------------------------------------------------------
@@ -138,7 +145,6 @@ param([ValidateSet("Lock","Unlock")][string]$Mode = "Lock")
 $ErrorActionPreference = "SilentlyContinue"
 
 $Dir      = "__INSTALLDIR__"
-$Port     = __PORT__
 $LogFile  = Join-Path $Dir "kiosk.log"
 $DoneLock = Join-Path $Dir "lock.done"
 $DoneUnlk = Join-Path $Dir "unlock.done"
@@ -236,11 +242,32 @@ if ($Mode -eq "Lock") {
     Set-Service -Name TabletInputService -StartupType Disabled
     Stop-Service  -Name TabletInputService -Force
 
-    # no sleep, no screensaver, no auto-lock
-    powercfg /change monitor-timeout-ac 0 | Out-Null
-    powercfg /change standby-timeout-ac 0 | Out-Null
-    Set-Reg "$UH\Control Panel\Desktop" "ScreenSaveActive" "0" "String"
+    # --- power: AC *and* battery ------------------------------------
+    # A Surface wedged behind a screen can lose its charger. Without the
+    # -dc lines the panel would blank and the device would sleep.
+    powercfg /change monitor-timeout-ac   0 | Out-Null
+    powercfg /change monitor-timeout-dc   0 | Out-Null
+    powercfg /change standby-timeout-ac   0 | Out-Null
+    powercfg /change standby-timeout-dc   0 | Out-Null
+    powercfg /change disk-timeout-ac      0 | Out-Null
+    powercfg /change disk-timeout-dc      0 | Out-Null
+    powercfg /change hibernate-timeout-ac 0 | Out-Null
+    powercfg /change hibernate-timeout-dc 0 | Out-Null
+
+    # physical power button and lid do nothing (0 = take no action)
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS PBUTTONACTION 0 | Out-Null
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS PBUTTONACTION 0 | Out-Null
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION     0 | Out-Null
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION     0 | Out-Null
+    powercfg /setactive SCHEME_CURRENT | Out-Null
+
+    # screensaver / auto-lock
+    Set-Reg "$UH\Control Panel\Desktop" "ScreenSaveActive"  "0" "String"
+    Set-Reg "$UH\Control Panel\Desktop" "ScreenSaveTimeOut" "0" "String"
     Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "InactivityTimeoutSecs" 0
+
+    # lock screen rotation - a bumped tablet must not flip sideways
+    Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AutoRotation" "Enable" 0
 
     Restart-Explorer
     New-Item -Path $DoneLock -ItemType File -Force | Out-Null
@@ -268,10 +295,19 @@ if ($Mode -eq "Unlock") {
     Set-Service   -Name TabletInputService -StartupType Manual
     Start-Service -Name TabletInputService
 
-    powercfg /change monitor-timeout-ac 15 | Out-Null
-    powercfg /change standby-timeout-ac 30 | Out-Null
+    powercfg /change monitor-timeout-ac  15 | Out-Null
+    powercfg /change monitor-timeout-dc   5 | Out-Null
+    powercfg /change standby-timeout-ac  30 | Out-Null
+    powercfg /change standby-timeout-dc  15 | Out-Null
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS PBUTTONACTION 3 | Out-Null
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS PBUTTONACTION 3 | Out-Null
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION     1 | Out-Null
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION     1 | Out-Null
+    powercfg /setactive SCHEME_CURRENT | Out-Null
+
     Set-Reg "$UH\Control Panel\Desktop" "ScreenSaveActive" "1" "String"
     Del-Val "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "InactivityTimeoutSecs"
+    Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AutoRotation" "Enable" 1
 
     Remove-Item (Join-Path $Dir "lock.done") -Force
     Restart-Explorer
@@ -331,8 +367,8 @@ Set-Content -Path (Join-Path $InstallDir "serve-mirror.ps1") -Value $servePs1 -E
 Step "Wrote serve-mirror.ps1"
 
 # =====================================================================
-#  start-map.vbs  - USER SESSION. This is the part that must not be
-#  a scheduled task, or Edge has no desktop to draw on.
+#  start-map.vbs  - USER SESSION. This is the part that must not be a
+#  scheduled task, or Edge has no desktop to draw on.
 # =====================================================================
 $vbs = @'
 ' ====================================================================
@@ -342,8 +378,16 @@ $vbs = @'
 '    1. trigger the SYSTEM lock task and wait for it to finish
 '    2. refresh the local mirror if GitHub is reachable
 '    3. launch Edge in kiosk mode IN THIS SESSION
-'    4. wait for Edge to close (Alt+F4 on the stand)
+'    4. wait for Edge to APPEAR, then wait for it to close
 '    5. trigger the SYSTEM unlock task
+'
+'  Step 4 is deliberately paranoid. An earlier version slept a fixed
+'  6 seconds and then read any absence of our Edge process as "the
+'  user closed it". On a loaded machine Edge can take far longer than
+'  that to start, so the script unlocked and killed the browser it had
+'  just launched - a blink and back to the desktop. Now it waits for
+'  the process to exist first, and needs several consecutive misses
+'  before believing it has gone.
 '
 '  To change the URL, edit MAP_URL below. Nothing else needs touching.
 ' ====================================================================
@@ -358,13 +402,18 @@ Const TASK_LOCK  = "__TASKLOCK__"
 Const TASK_UNLK  = "__TASKUNLOCK__"
 Const USE_MIRROR = __USEMIRROR__
 
-Dim sh, fso, profileDir, url, marker, serverStarted
+' --- tuning ---------------------------------------------------------
+Const START_TIMEOUT_MS = 90000   ' how long Edge may take to appear
+Const POLL_MS          = 2000    ' gap between liveness polls
+Const MISSES_TO_CLOSE  = 3       ' consecutive misses = really closed
+
+Dim sh, fso, wmi, profileDir, url, marker, serverPid
 Set sh  = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
-serverStarted = False
-marker        = "onskioskmap"
-profileDir    = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\ONSKioskMap\profile"
+serverPid  = 0
+marker     = "onskioskmap"
+profileDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\ONSKioskMap\profile"
 
 Sub Log(msg)
     On Error Resume Next
@@ -374,6 +423,51 @@ Sub Log(msg)
     On Error GoTo 0
 End Sub
 
+' Returns: 1 = our Edge is running, 0 = not running, -1 = query failed.
+' A failed query must never be read as "closed", or a WMI hiccup under
+' load would tear the kiosk down.
+Function EdgeState()
+    Dim procs, p, found
+    found = 0
+    On Error Resume Next
+    Err.Clear
+    Set procs = wmi.ExecQuery("SELECT CommandLine FROM Win32_Process WHERE Name='msedge.exe'")
+    If Err.Number <> 0 Then
+        EdgeState = -1
+        On Error GoTo 0
+        Exit Function
+    End If
+    For Each p In procs
+        If Not IsNull(p.CommandLine) Then
+            If InStr(p.CommandLine, marker) > 0 Then found = 1
+        End If
+    Next
+    If Err.Number <> 0 Then
+        EdgeState = -1
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+    EdgeState = found
+End Function
+
+Sub KillOurEdge()
+    ' Only our own kiosk processes - never anybody else's windows.
+    Dim procs, p
+    On Error Resume Next
+    Set procs = wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='msedge.exe'")
+    For Each p In procs
+        If Not IsNull(p.CommandLine) Then
+            If InStr(p.CommandLine, marker) > 0 Then
+                sh.Run "taskkill /F /PID " & p.ProcessId, 0, True
+            End If
+        End If
+    Next
+    On Error GoTo 0
+End Sub
+
+Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+
 ' ---- 1. lock Windows down ------------------------------------------
 On Error Resume Next
 fso.DeleteFile DIR & "\lock.done", True
@@ -382,13 +476,11 @@ On Error GoTo 0
 Log "requesting lockdown"
 sh.Run "schtasks /run /tn """ & TASK_LOCK & """", 0, True
 
-' wait for the lock task to signal completion (it restarts Explorer,
-' which takes a couple of seconds)
 Dim waited : waited = 0
 Do While Not fso.FileExists(DIR & "\lock.done")
     WScript.Sleep 500
     waited = waited + 500
-    If waited > 30000 Then
+    If waited > 45000 Then
         Log "lockdown timed out - continuing anyway"
         Exit Do
     End If
@@ -428,7 +520,18 @@ If USE_MIRROR Then
         sh.Run "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & _
                DIR & "\serve-mirror.ps1""", 0, False
         WScript.Sleep 1500
-        serverStarted = True
+
+        ' remember the listener's PID so we stop exactly that process
+        On Error Resume Next
+        Dim sp, sprocs
+        Set sprocs = wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='powershell.exe'")
+        For Each sp In sprocs
+            If Not IsNull(sp.CommandLine) Then
+                If InStr(sp.CommandLine, "serve-mirror.ps1") > 0 Then serverPid = sp.ProcessId
+            End If
+        Next
+        On Error GoTo 0
+
         url = "http://127.0.0.1:" & PORT & "/theMap.html"
     Else
         Log "live unreachable and no mirror - trying live anyway"
@@ -443,10 +546,10 @@ Else
 End If
 
 ' ---- 3. launch Edge in THIS session --------------------------------
-On Error Resume Next
-sh.Run "taskkill /F /IM msedge.exe", 0, True
-On Error GoTo 0
-WScript.Sleep 1000
+' Our own --user-data-dir means Edge always spawns a separate browser
+' process, so there is no need to kill anyone else's Edge first.
+KillOurEdge
+WScript.Sleep 500
 
 On Error Resume Next
 fso.DeleteFolder profileDir, True
@@ -473,48 +576,63 @@ args = " --kiosk """ & url & """" & _
 Log "launching Edge"
 sh.Run """" & EDGE & """" & args, 1, False
 
-' ---- 4. wait for our Edge to close ---------------------------------
-' Match on our own marker switch so an unrelated Edge update process
-' can never hold the session open.
-WScript.Sleep 6000
-Dim wmi, procs
-Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+' ---- 4a. wait for Edge to APPEAR -----------------------------------
+Dim elapsed, state, appeared
+elapsed  = 0
+appeared = False
 
-Do
-    WScript.Sleep 2000
-    Dim alive : alive = False
-    On Error Resume Next
-    Set procs = wmi.ExecQuery("SELECT CommandLine FROM Win32_Process WHERE Name='msedge.exe'")
-    Dim p
-    For Each p In procs
-        If Not IsNull(p.CommandLine) Then
-            If InStr(p.CommandLine, marker) > 0 Then alive = True
+Do While elapsed < START_TIMEOUT_MS
+    WScript.Sleep 1000
+    elapsed = elapsed + 1000
+    state = EdgeState()
+    If state = 1 Then
+        appeared = True
+        Log "Edge is up after " & CStr(elapsed \ 1000) & "s"
+        Exit Do
+    End If
+Loop
+
+If Not appeared Then
+    ' Edge genuinely failed to start. Give the desktop back rather than
+    ' leaving the machine locked down with nothing on screen.
+    Log "ERROR: Edge never appeared within " & CStr(START_TIMEOUT_MS \ 1000) & "s - unlocking"
+Else
+    ' ---- 4b. wait for it to close ----------------------------------
+    Dim misses
+    misses = 0
+    Do
+        WScript.Sleep POLL_MS
+        state = EdgeState()
+        If state = 1 Then
+            misses = 0
+        ElseIf state = 0 Then
+            misses = misses + 1
+        Else
+            Log "WMI query failed, ignoring this poll"
         End If
-    Next
-    On Error GoTo 0
-Loop While alive
+    Loop While misses < MISSES_TO_CLOSE
 
-Log "Edge closed"
+    Log "Edge closed"
+End If
 
 ' ---- 5. give the desktop back --------------------------------------
-If serverStarted Then
+If serverPid <> 0 Then
     On Error Resume Next
-    sh.Run "taskkill /F /FI ""WINDOWTITLE eq serve-mirror*""", 0, True
+    sh.Run "taskkill /F /PID " & serverPid, 0, True
     On Error GoTo 0
 End If
 
-On Error Resume Next
-sh.Run "taskkill /F /IM msedge.exe", 0, True
-On Error GoTo 0
+KillOurEdge
 
 Log "requesting unlock"
 sh.Run "schtasks /run /tn """ & TASK_UNLK & """", 0, True
 
+Set wmi = Nothing
 Set sh  = Nothing
 Set fso = Nothing
 '@
 
-$useMirror = if ($NoFallback) { "False" } else { "True" }
+if ($NoFallback) { $useMirror = "False" } else { $useMirror = "True" }
 $vbs = $vbs.Replace("__URL__", $Url).
             Replace("__EDGE__", $edge).
             Replace("__INSTALLDIR__", $InstallDir).
@@ -545,10 +663,21 @@ foreach ($pair in @(@($TaskLock,"Lock"), @($TaskUnlock,"Unlock"))) {
 }
 Step "Registered '$TaskLock' and '$TaskUnlock' (SYSTEM, no UAC prompt)"
 
-# Any user must be able to trigger the tasks, including a non-admin stand account.
-foreach ($t in @($TaskLock, $TaskUnlock)) {
-    $sd = (Get-ScheduledTask -TaskName $t | Get-ScheduledTaskInfo) 2>$null
-    schtasks /change /tn "$t" /enable 2>$null | Out-Null
+# Let a standard (non-admin) stand account trigger the tasks. Without an
+# explicit descriptor, schtasks /run from a limited user can be denied.
+try {
+    $svc = New-Object -ComObject Schedule.Service
+    $svc.Connect()
+    $folder = $svc.GetFolder("\")
+    # Admins + SYSTEM full control; Authenticated Users read + execute.
+    $sddl = "D:(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;AU)"
+    foreach ($t in @($TaskLock, $TaskUnlock)) {
+        $folder.GetTask($t).SetSecurityDescriptor($sddl, 0)
+    }
+    Step "Task permissions widened so a standard user can trigger them"
+} catch {
+    Warn "Could not set task permissions: $($_.Exception.Message)"
+    Warn "Not a problem if the stand account is an administrator."
 }
 
 # =====================================================================
@@ -560,21 +689,20 @@ if (-not $NoFallback) {
     netsh advfirewall firewall delete rule name="ONS map local mirror" 2>$null | Out-Null
     netsh advfirewall firewall add rule name="ONS map local mirror" dir=in action=block `
         protocol=TCP localport=$Port remoteip=any 2>$null | Out-Null
-    Step "Loopback reservation added for port $Port; inbound blocked from the network"
+    Step "Loopback reservation for port $Port; inbound blocked from the network"
 
-    # seed the mirror now
     try {
         Invoke-WebRequest -Uri $Url -OutFile (Join-Path $mirrorDir "theMap.html") -UseBasicParsing -TimeoutSec 25
         $kb = [math]::Round((Get-Item (Join-Path $mirrorDir "theMap.html")).Length / 1KB, 1)
         Step "Mirror seeded ($kb KB)"
     } catch {
         Warn "Could not seed the mirror: $($_.Exception.Message)"
-        Warn "It will be filled in on the first successful launch."
+        Warn "It will fill in on the first successful launch."
     }
 }
 
 # =====================================================================
-#  DESKTOP ICONS
+#  ICONS
 # =====================================================================
 $wsh = New-Object -ComObject WScript.Shell
 
@@ -597,17 +725,30 @@ $r.WindowStyle      = 7
 $r.Save()
 Step "Desktop icons: 'ONS Map', 'Restore Desktop'"
 
+if ($AutoStart) {
+    Copy-Item $lnkStart $lnkAuto -Force
+    Step "Added to all-users Startup - launches at logon"
+} else {
+    Remove-Item $lnkAuto -Force -ErrorAction SilentlyContinue
+}
+
 # =====================================================================
 Write-Host "`n  Done - no reboot needed.`n" -ForegroundColor Green
 Write-Host "  TEST NOW" -ForegroundColor Yellow
 Write-Host "    1. Tap 'ONS Map'. One black flash (Explorer restart), then the map"
 Write-Host "       fullscreen. It should STAY up."
 Write-Host "    2. Check every button, including the wind layer and minerals basemap."
-Write-Host "    3. Alt+F4. Desktop returns, taskbar back, Edge browses normally again."
-Write-Host "    4. Tail the log if anything misbehaves:"
+Write-Host "    3. Alt+F4. Desktop returns, taskbar back, Edge browses normally."
+Write-Host "    4. If anything misbehaves:"
 Write-Host "         Get-Content '$InstallDir\kiosk.log' -Tail 30"
 Write-Host ""
-Write-Host "  FALLBACK TEST (do this before the event)" -ForegroundColor Yellow
+Write-Host "  FALLBACK TEST (do this once before the event)" -ForegroundColor Yellow
 Write-Host "    Add to C:\Windows\System32\drivers\etc\hosts:  127.0.0.2 sidagis.github.io"
 Write-Host "    Launch again - the log should say 'serving local mirror'."
-Write-Host "    Remove the hosts line afterwards.`n"
+Write-Host "    Remove the hosts line afterwards."
+Write-Host ""
+if (-not $AutoStart) {
+    Write-Host "  TIP: for a dedicated device, re-run with -AutoStart so an overnight" -ForegroundColor DarkGray
+    Write-Host "       reboot brings the map back without anyone reaching behind the screen." -ForegroundColor DarkGray
+    Write-Host ""
+}
