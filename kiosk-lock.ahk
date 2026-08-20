@@ -41,7 +41,7 @@ global lastResetHow := "-"         ; diagnostics
 ; counts those as user input. So idle time is tracked here rather than
 ; read straight from A_TimeIdle - see UpdateIdle().
 global lastRealInput := A_TickCount
-global suppressUntil := 0
+global injectTime := 0             ; moment of our last injected click or keystroke
 global warmSent := false
 global inputSinceReset := false    ; has a visitor touched it since the last reset
 global houseKept := false
@@ -241,19 +241,32 @@ BuildEdgeArgs() {
 ; moment after we inject anything. If a visitor really does touch the
 ; screen during that window, the next tick still picks it up, because
 ; A_TimeIdle keeps counting from their touch.
+; Our own injected clicks and keystrokes update the Windows "last input"
+; time, and Windows goes on reporting them as the most recent input for
+; as long as nobody touches the screen. A time window is not enough to
+; ignore them - the moment it expires, the stale click is still the newest
+; input and gets counted as a visitor, restarting the whole countdown.
+; So the exact moment of each injection is recorded and any "last input"
+; matching it is discarded, however long ago it was.
 UpdateIdle() {
-    global lastRealInput, suppressUntil, inputSinceReset, houseKept
+    global lastRealInput, injectTime, inputSinceReset, houseKept
     t := A_TickCount - A_TimeIdle
-    if (t > lastRealInput && A_TickCount > suppressUntil) {
-        lastRealInput := t
-        inputSinceReset := true       ; a real visitor, not one of our clicks
-        houseKept := false
-    }
+
+    if (t <= lastRealInput)
+        return
+    if (injectTime && Abs(t - injectTime) <= 500)
+        return                        ; that input was ours
+
+    lastRealInput := t
+    inputSinceReset := true           ; a real visitor
+    houseKept := false
 }
 
-Injecting(ms := 1500) {
-    global suppressUntil
-    suppressUntil := A_TickCount + ms
+; Call immediately AFTER injecting anything, so the recorded moment
+; matches the last synthetic event Windows saw.
+Injecting() {
+    global injectTime
+    injectTime := A_TickCount
 }
 
 IdleMs() {
@@ -293,7 +306,7 @@ IdleWatch() {
         if (CFG["FastReset"] && USES_WRAPPER && !warmSent && inputSinceReset
             && idle >= (CFG["IdleSeconds"] - CFG["PrewarmSeconds"]) * 1000) {
             warmSent := true
-            TapZone("warm")
+            TapZone("warm", false)        ; posted click only - never move the cursor
         }
         return
     }
@@ -652,8 +665,8 @@ HardReload() {
         WinActivate hwnd
         WinWaitActive hwnd, , 2
     }
-    Injecting()
     SendInput "{F5}"
+    Injecting()
     lastResetHow := "reload"
 }
 
@@ -683,17 +696,18 @@ TapZone(which, realClick := true) {
     cx := (which = "reset") ? 4 : ww - 5          ; client coordinates
     cy := 4
 
-    Injecting()
     if (!realClick) {
-        ; Posted message: no cursor movement, no visible pointer. Chromium
-        ; does not always honour these, hence the verification upstairs.
+        ; Posted message: no cursor movement, no visible pointer, and it
+        ; does not register as system input at all.
         try ControlClick "X" cx " Y" cy, hwnd, , "Left", 1, "NA"
+        Injecting()
         return
     }
 
     MouseGetPos &ox, &oy
     try Click(wx + cx, wy + cy)
     try MouseMove ox, oy, 0
+    Injecting()                                   ; after the last synthetic event
 }
 
 ; =====================================================================
