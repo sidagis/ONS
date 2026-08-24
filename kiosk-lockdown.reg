@@ -53,6 +53,9 @@ Windows Registry Editor Version 5.00
 "4"="[*.]arcgis.net"
 "5"="[*.]vimeo.com"
 "6"="[*.]vimeocdn.com"
+"7"="[*.]github.io"
+"8"="[*.]githubusercontent.com"
+"9"="[*.]sodir.no"
 
 ; ---------------------------------------------------------------------
 ;  Stop Edge updating itself during opening hours. The command-line
