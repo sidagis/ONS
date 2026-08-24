@@ -48,9 +48,12 @@ echo   -----------------------
 echo.
 echo   Signed in as: %USERDOMAIN%\%USERNAME%
 echo.
-echo   1  Lock the machine down  (Windows + Edge restrictions)
-echo   2  Lock down AND stop Explorer from starting  (full kiosk)
-echo   3  Remove all restrictions  (maintenance)
+echo   The lockdown is now applied automatically every time the kiosk
+echo   starts, and reverted when it exits. This menu is for repair.
+echo.
+echo   1  Re-register the lockdown tasks  (run after an update)
+echo   2  Make the kiosk the Windows shell  (legacy, permanent)
+echo   3  Remove all restrictions NOW  (maintenance)
 echo   4  CHECK what is actually applied on this machine
 echo   5  Cancel
 echo.
@@ -65,7 +68,7 @@ if "%PICK%"=="5" goto :eof
 goto menu
 
 :lock
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Lockdown -InstallDir "%INSTALLDIR%" -KioskUser "%KIOSKUSER%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Tasks -InstallDir "%INSTALLDIR%"
 goto :eof
 
 :lockshell
