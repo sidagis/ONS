@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="no">
+<html lang="en">
 
 <head>
   <meta charset="utf-8" />
@@ -275,6 +275,114 @@
       height: 54px;
       font-size: 22px;
     }
+
+
+  #attract {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  transform: translateY(-18%);
+  gap: 34px;
+  z-index: 9999;
+  pointer-events: none;    
+  opacity: 0;
+  transition: opacity .45s ease;
+}
+#attract.show { opacity: 1; }
+
+#attract .glow {
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 620px; height: 620px;
+  margin: -310px 0 0 -310px;
+  border-radius: 50%;
+  background: radial-gradient(circle,
+      rgba(255,255,255,.88) 0%,
+      rgba(255,255,255,.55) 38%,
+      rgba(255,255,255,0) 70%);
+  animation: attractBreathe 5s ease-in-out infinite;
+}
+@keyframes attractBreathe {
+  0%, 100% { transform: scale(1);    opacity: .92; }
+  50%      { transform: scale(1.06); opacity: 1; }
+}
+
+/* Fixed box, never shrinks, and it is the positioning parent. */
+#attract .rings {
+  position: relative;
+  flex: 0 0 auto;
+  width: 150px;
+  height: 150px;
+  z-index: 1;
+}
+
+/* Sized in pixels and self-centred, so it stays tied to the hand
+   even if the parent box misbehaves. */
+#attract .rings span {
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 132px; height: 132px;
+  margin: 0;
+  border: 3px solid rgba(0,90,130,.5);
+  border-radius: 50%;
+  will-change: transform, opacity;
+  transform: translate(-50%,-50%) scale(.9);
+  animation: attractRing 5s cubic-bezier(.22,.68,.28,1) infinite;
+}
+#attract .rings span:nth-child(n+2) { display: none; }
+
+@keyframes attractRing {
+  0%, 9%  { transform: translate(-50%,-50%) scale(.9);  opacity: 0; }
+  13%     { opacity: .5; }
+  60%     { transform: translate(-50%,-50%) scale(1.55); opacity: 0; }
+  100%    { transform: translate(-50%,-50%) scale(1.55); opacity: 0; }
+}
+
+#attract .hand {
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 94px; height: 94px;
+  margin: -37px 0 0 -37px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  will-change: transform;
+  animation: attractTap 5s ease-in-out infinite;
+}
+#attract .hand svg {
+  width: 74px; height: 74px;
+  fill: rgba(126, 126, 126, 0.68);
+  filter:
+    drop-shadow(0 1px 2px rgba(255,255,255,.95))
+    drop-shadow(0 3px 10px rgba(255,255,255,.8))
+    drop-shadow(0 10px 22px rgba(0,0,0,.3));
+}
+
+@keyframes attractTap {
+  0%, 5%, 20%, 100% { transform: translateY(0) scale(1); }
+  9%                { transform: translateY(9px) scale(.93); }
+  15%               { transform: translateY(0) scale(1); }
+}
+
+#attract .label {
+  position: relative;
+  z-index: 1;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 40px;
+  font-weight: 700;
+  letter-spacing: .01em;
+  color: rgba(114, 114, 114, 0.501);
+  text-align: center;
+  text-shadow:
+    0 1px 0    rgba(255,255,255,.95),
+    0 2px 10px rgba(255,255,255,.9),
+    0 4px 16px rgba(255,255,255,.65),
+    0 10px 26px rgba(121, 120, 120, 0.3);
+  transition: opacity .5s ease;
+}
   </style>
 </head>
 
@@ -5567,6 +5675,17 @@
 </svg>
     </div>
 
+
+      <div id="attract" aria-hidden="true">
+  <div class="glow"></div>
+  <div class="rings">
+    <span></span><span></span><span></span>
+    <div class="hand">
+      <svg viewBox="0 0 24 24"><path d="M9 11.5V4.5a1.5 1.5 0 0 1 3 0v5.9h.6V3.3a1.5 1.5 0 0 1 3 0v7.1h.6V5.6a1.5 1.5 0 0 1 3 0v9.3c0 3.6-2.4 6.6-6.2 6.6-3.1 0-4.6-1.4-6.4-4.3L7 14.6c-.6-1-.2-2 .7-2.4.8-.4 1.6-.1 2 .6l-.7-1.3z"/></svg>
+    </div>
+  </div>
+  <div class="label" id="attractLabel">Touch to explore</div>
+</div>
     <!-- ============ INTERACTIVE BUTTON PANEL (right side) ============ -->
     <div id="buttonPanel">
       <div class="panelHeading"></div>
@@ -5797,11 +5916,13 @@ window.addEventListener("contextmenu", function (e) {
           snapshotDefaults();
 
           goToExtent(CONFIG.extents.home, false).finally(function () {
+            setTimeout(showAttract, 1500);
             initialViewpoint = view.viewpoint.clone();
             const homeScale = view.scale;
             view.constraints.minScale = homeScale * 2;
             view.constraints.maxScale = 0;
             armIdleTimer();
+            
           });
         });
       }).catch(function (err) {
@@ -6160,6 +6281,39 @@ window.addEventListener("contextmenu", function (e) {
         });
       });
 
+const attractEl    = document.getElementById("attract");
+const attractLabel = document.getElementById("attractLabel");
+const ATTRACT_TEXT = ["Touch to explore"];
+let attractIdx = 0;
+let attractCycle = null;
+
+function attractNode() { return document.getElementById("attract"); }
+
+function showAttract() {
+  const el = attractNode();
+  if (!el) { console.warn("attract element not found"); return; }
+  if (el.classList.contains("show")) return;
+  el.classList.add("show");
+
+  const label = document.getElementById("attractLabel");
+  if (!label || ATTRACT_TEXT.length < 2) return;   // nothing to rotate
+
+  attractCycle = setInterval(function () {
+    attractIdx = (attractIdx + 1) % ATTRACT_TEXT.length;
+    label.style.opacity = 0;
+    setTimeout(function () {
+      label.textContent = ATTRACT_TEXT[attractIdx];
+      label.style.opacity = 1;
+    }, 500);
+  }, 4000);
+}
+
+function hideAttract() {
+  const el = attractNode();
+  if (!el || !el.classList.contains("show")) return;
+  el.classList.remove("show");
+  if (attractCycle) { clearInterval(attractCycle); attractCycle = null; }
+}
   
   //       IDLE RESET 
       function armIdleTimer() {
@@ -6167,6 +6321,7 @@ window.addEventListener("contextmenu", function (e) {
         idleTimer = setTimeout(idleReset, CONFIG.idleMs);
       }
       function idleReset() {
+        showAttract();
         resetToDefaults();
         if (initialViewpoint) {
           view.goTo(initialViewpoint, { duration: 900 }).catch(function () { });
@@ -6179,7 +6334,10 @@ window.addEventListener("contextmenu", function (e) {
       // Reset idle timer on ANY interaction (touch, mouse, map drag, zoom).
       ["pointerdown", "pointermove", "wheel", "touchstart", "keydown"]
         .forEach(function (evt) {
-          window.addEventListener(evt, armIdleTimer, { passive: true });
+          window.addEventListener(evt, function () {
+         armIdleTimer();
+          hideAttract();
+    }, { passive: true });
         });
       // Map view interactions (pan/zoom) also count.
       
