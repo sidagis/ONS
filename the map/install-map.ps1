@@ -458,7 +458,7 @@ Const RELAUNCH_GAP_MS   = 3000   ' pause before bringing Edge back
 Const MAX_LAUNCH_FAILS  = 5      ' give up and unlock after this many
 
 Dim sh, fso, wmi, profileDir, url, marker, serverPid, edgePid
-Dim edgeArgs, stopFlag, fails, running, state, misses
+Dim edgeArgs, stopFlag, fails, running, state, misses, cleanExit
 Set sh  = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
@@ -531,6 +531,25 @@ Function EdgeState()
     End If
     On Error GoTo 0
     EdgeState = found
+End Function
+' Did Edge shut down cleanly, or did it die? Chromium writes exit_type
+' "Crashed" into the profile while the browser is open and rewrites it
+' to "Normal" on an orderly shutdown. That is how Alt+F4 is told apart
+' from a crash, so one closes the session and the other is relaunched.
+Function EdgeExitedCleanly()
+    Dim prefs, ts, txt
+    EdgeExitedCleanly = False
+    prefs = profileDir & "\Default\Preferences"
+    On Error Resume Next
+    If Not fso.FileExists(prefs) Then Exit Function
+    Set ts = fso.OpenTextFile(prefs, 1, False)
+    txt = ts.ReadAll
+    ts.Close
+    If Err.Number <> 0 Then Exit Function
+    On Error GoTo 0
+    If InStr(Replace(txt, " ", ""), """exit_type"":""Normal""") > 0 Then
+        EdgeExitedCleanly = True
+    End If
 End Function
 
 Sub KillOurEdge()
@@ -719,6 +738,7 @@ Do
     Else
         fails = 0
         misses = 0
+        cleanExit = False
         Do
             WScript.Sleep POLL_MS
             If fso.FileExists(stopFlag) Then Exit Do
@@ -727,13 +747,25 @@ Do
                 misses = 0
             ElseIf state = 0 Then
                 misses = misses + 1
+                ' Checked on the first miss, not after the full count, so
+                ' Alt+F4 gives the desktop back in about five seconds
+                ' rather than ten.
+                If EdgeExitedCleanly() Then
+                    cleanExit = True
+                    Exit Do
+                End If
             Else
                 Log "WMI query failed, ignoring this poll"
             End If
         Loop While misses < MISSES_TO_CLOSE
 
+        If cleanExit Then
+            Log "Edge was closed deliberately (Alt+F4) - ending the session"
+            Exit Do
+        End If
+
         If Not fso.FileExists(stopFlag) Then
-            Log "Edge vanished - relaunching"
+            Log "Edge vanished unexpectedly - relaunching"
             WScript.Sleep RELAUNCH_GAP_MS
         End If
     End If
