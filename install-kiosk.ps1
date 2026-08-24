@@ -29,7 +29,7 @@ param(
     [string]$AppUrl,
     [int]$IdleSeconds = 0,
 
-    [ValidateSet('Install','Lockdown','Unlock','Verify','Tasks')]
+    [ValidateSet('Install','Lockdown','Unlock','Verify')]
     [string]$Mode = 'Install',
 
     # Lockdown only: also make the kiosk the Windows shell for this user,
