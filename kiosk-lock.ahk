@@ -77,6 +77,12 @@ global EDGE_ARGS := BuildEdgeArgs()
 
 ; --------------------------- start up --------------------------------
 KeepAwake()
+
+; Lock first: Edge reads its URL policy at launch, so applying the allow
+; list afterwards would leave the first session of the day unrestricted.
+if (CFG["SessionLockdown"])
+    LockSession()
+
 if (CFG["MuteOutput"])
     MuteOutput()
 KillStaleEdge()
@@ -140,6 +146,12 @@ LoadConfig() {
     c["RestartEveryResets"]  := NumOr(IniRead(INI, "Kiosk", "RestartEveryResets", 25), 25)
     c["MaxEdgeMemoryMB"]     := NumOr(IniRead(INI, "Kiosk", "MaxEdgeMemoryMB", 2500), 2500)
     c["NightlyRestart"]      := Trim(IniRead(INI, "Kiosk", "NightlyRestart", "03:30"))
+    c["RestartMinIntervalMinutes"] := NumOr(IniRead(INI, "Kiosk", "RestartMinIntervalMinutes", 20), 20)
+
+    c["SessionLockdown"]     := NumOr(IniRead(INI, "Kiosk", "SessionLockdown", 1), 1)
+    c["KillExplorer"]        := NumOr(IniRead(INI, "Kiosk", "KillExplorer", 1), 1)
+    c["TaskLock"]            := Trim(IniRead(INI, "Kiosk", "TaskLock", "ONS Kiosk Lock"))
+    c["TaskUnlock"]          := Trim(IniRead(INI, "Kiosk", "TaskUnlock", "ONS Kiosk Unlock"))
     c["RestartMinIntervalMinutes"] := NumOr(IniRead(INI, "Kiosk", "RestartMinIntervalMinutes", 20), 20)
 
     if (c["IdleSeconds"] < 5)                          ; a typo must not brick the kiosk
@@ -1042,7 +1054,113 @@ LogLine(text) {
         FileAppend FormatTime(, "yyyy-MM-dd HH:mm:ss") "  " text "`n", LOGFILE, "UTF-8-RAW"
     }
 }
+; =====================================================================
+;  Session lockdown
+; =====================================================================
+; The restrictions are applied and reverted around each session by two
+; SYSTEM scheduled tasks, rather than being left on the machine for good.
+; SYSTEM is needed for HKLM policy and services; it also means the
+; per-user policies land in the hive of whoever is actually signed in,
+; which is what the old reg-import approach kept getting wrong.
+;
+; Anything that has to happen in the USER's session - killing Explorer,
+; starting it again - is done here, because a session 0 task cannot.
 
+MySessionId() {
+    static sid := -1
+    if (sid = -1) {
+        s := 0
+        DllCall("kernel32\ProcessIdToSessionId"
+              , "uint", DllCall("kernel32\GetCurrentProcessId", "uint")
+              , "uint*", &s)
+        sid := s
+    }
+    return sid
+}
+
+; ProcessExist("explorer.exe") is machine-wide: an administrator signed in
+; on a second session would look like a lockdown failure that is not real.
+ExplorerInThisSession() {
+    try {
+        for p in ComObjGet("winmgmts:\\.\root\cimv2").ExecQuery(
+            "SELECT SessionId FROM Win32_Process WHERE Name='explorer.exe'")
+            if (p.SessionId = MySessionId())
+                return true
+    }
+    return false
+}
+
+KillExplorerInThisSession() {
+    pids := []
+    try {
+        for p in ComObjGet("winmgmts:\\.\root\cimv2").ExecQuery(
+            "SELECT ProcessId, SessionId FROM Win32_Process WHERE Name='explorer.exe'")
+            if (p.SessionId = MySessionId())
+                pids.Push(p.ProcessId)
+    }
+    for pid in pids
+        try ProcessClose pid
+    return pids.Length
+}
+
+RunTask(name) {
+    try RunWait A_ComSpec ' /c schtasks /run /tn "' name '"', , "Hide"
+}
+
+WaitForFlag(path, timeoutMs) {
+    try FileDelete path
+    t0 := Tick()
+    while (!FileExist(path) && Tick() - t0 < timeoutMs)
+        Sleep 250
+    return FileExist(path) ? true : false
+}
+
+LockSession() {
+    global CFG
+
+    LogLine("requesting lockdown")
+    try FileDelete A_ScriptDir "\lock.done"
+    RunTask(CFG["TaskLock"])
+
+    if WaitForFlag(A_ScriptDir "\lock.done", 45000)
+        LogLine("lockdown applied")
+    else
+        LogLine("WARNING: lockdown did not confirm within 45s - continuing anyway")
+
+    if (CFG["KillExplorer"]) {
+        ; The Lock task has already set AutoRestartShell=0, so Winlogon
+        ; will not bring it back. Loop because Explorer can be mid-launch.
+        Loop 6 {
+            n := KillExplorerInThisSession()
+            Sleep 400
+            if (!ExplorerInThisSession())
+                break
+        }
+        if ExplorerInThisSession()
+            LogLine("WARNING: Explorer is still running - taskbar may be reachable")
+        else
+            LogLine("Explorer stopped for this session")
+    }
+}
+
+UnlockSession() {
+    global CFG
+    static done := false
+    if (done)
+        return
+    done := true
+
+    LogLine("requesting unlock")
+    RunTask(CFG["TaskUnlock"])
+    WaitForFlag(A_ScriptDir "\unlock.done", 20000)
+
+    ; Start Explorer only after the policies are back, so it comes up
+    ; against a normal configuration rather than the kiosk one.
+    if (CFG["ExitToDesktop"] && !ExplorerInThisSession())
+        try Run "explorer.exe"
+
+    LogLine("session ended")
+}
 ; =====================================================================
 ;  Tray menu (setup and diagnostics)
 ;  Reachable only while BlockMouseButtons=0 in kiosk.ini, and invisible
@@ -1244,14 +1362,28 @@ ExitKiosk() {
 
     SetTimer IdleWatch, 0
     SetTimer EdgeWatch, 0
+    SetTimer MotionTick, 0
     Suspend true                      ; release every blocked key
 
-    try ProcessClose "msedge.exe"
+    ; ProcessClose closes only the first match, and Edge is ten processes.
+    try RunWait A_ComSpec ' /c taskkill /f /im msedge.exe', , "Hide"
     Sleep 400
-    try ProcessClose "msedge.exe"     ; second pass for stragglers
 
-    if (CFG["ExitToDesktop"] && !ExplorerInThisSession())
+    if (CFG["SessionLockdown"])
+        UnlockSession()
+    else if (CFG["ExitToDesktop"] && !ExplorerInThisSession())
         try Run "explorer.exe"
 
     ExitApp
+}
+
+; A script error, a shutdown, or Exit from the tray must not leave the
+; machine locked down with no shell. UnlockSession() is idempotent.
+OnExit(KioskOnExit)
+KioskOnExit(reason, code) {
+    global exiting, CFG
+    if (!exiting && CFG["SessionLockdown"]) {
+        try UnlockSession()
+    }
+    return 0
 }
