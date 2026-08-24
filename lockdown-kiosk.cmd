@@ -12,12 +12,21 @@ rem =====================================================================
 
 set "INSTALLDIR=C:\Kiosk"
 
+rem Capture who is signed in BEFORE elevating. UAC may run the elevated
+rem copy as a different (administrator) account, and the per-user
+rem policies have to land in the KIOSK account's hive, not that one.
+if not "%~1"=="" (
+  set "KIOSKUSER=%~1"
+) else (
+  set "KIOSKUSER=%USERDOMAIN%\%USERNAME%"
+)
+
 net session >nul 2>&1
 if errorlevel 1 (
   echo.
   echo  Asking for administrator rights...
   powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "Start-Process -FilePath '%~f0' -Verb RunAs"
+    "Start-Process -FilePath '%~f0' -ArgumentList '%KIOSKUSER%' -Verb RunAs"
   exit /b
 )
 
@@ -56,7 +65,7 @@ if "%PICK%"=="5" goto :eof
 goto menu
 
 :lock
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Lockdown -InstallDir "%INSTALLDIR%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Lockdown -InstallDir "%INSTALLDIR%" -KioskUser "%KIOSKUSER%"
 goto :eof
 
 :lockshell
@@ -67,13 +76,13 @@ echo   no Task View. Alt+F4 brings the desktop back for that session.
 echo.
 choice /c YN /m "  Continue"
 if errorlevel 2 goto menu
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Lockdown -SetShell -InstallDir "%INSTALLDIR%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Lockdown -SetShell -InstallDir "%INSTALLDIR%" -KioskUser "%KIOSKUSER%"
 goto :eof
 
 :verify
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Verify -InstallDir "%INSTALLDIR%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Verify -InstallDir "%INSTALLDIR%" -KioskUser "%KIOSKUSER%"
 goto :eof
 
 :unlock
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Unlock -InstallDir "%INSTALLDIR%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Unlock -InstallDir "%INSTALLDIR%" -KioskUser "%KIOSKUSER%"
 goto :eof
