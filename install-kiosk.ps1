@@ -29,7 +29,7 @@ param(
     [string]$AppUrl,
     [int]$IdleSeconds = 0,
 
-    [ValidateSet('Install','Lockdown','Unlock','Verify')]
+    [ValidateSet('Install','Lockdown','Unlock','Verify','Tasks')]
     [string]$Mode = 'Install',
 
     # Lockdown only: also make the kiosk the Windows shell for this user,
@@ -285,10 +285,19 @@ function Add-Shortcuts {
             -WorkDir $Dir -Icon 'shell32.dll,220' `
             -Description 'Unlock Windows if a kiosk session was interrupted.'
     }
-    }
+
+    # What used to be done by setting the shell. A dedicated stand should
+    # come straight back up after a power cut without anyone reaching
+    # behind the screen; pair this with auto sign-in (netplwiz).
+    $startup = Join-Path ([Environment]::GetFolderPath('CommonStartup')) 'Start Kiosk.lnk'
+    New-Shortcut -Path $startup `
+        -Target $Ahk -Arguments ('"' + (Join-Path $Dir 'kiosk-lock.ahk') + '"') `
+        -WorkDir $Dir -Icon 'shell32.dll,14' `
+        -Description 'Start the ArcGIS kiosk at sign-in.'
+    Say 'the kiosk will start automatically at sign-in'
+
     Say "shortcuts created on the desktop and under Start > Kiosk"
 }
-
 # ---------------------------------------------------------------------
 #  Power
 # ---------------------------------------------------------------------
@@ -505,13 +514,14 @@ function Invoke-Verify {
 }
 
 function Invoke-Unlock {
-    # Revert a live session first, in case one is running.
-    foreach ($n in 'ONS Kiosk Lock','ONS Kiosk Unlock','ONS Kiosk Recover') {
-        if (Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue) {
-            if ($n -eq 'ONS Kiosk Unlock') { Start-ScheduledTask -TaskName $n; Start-Sleep -Seconds 5 }
-        }
-    }
     param([string]$Dir)
+
+    # Revert a live session first, in case one is running.
+    if (Get-ScheduledTask -TaskName 'ONS Kiosk Unlock' -ErrorAction SilentlyContinue) {
+        Start-ScheduledTask -TaskName 'ONS Kiosk Unlock'
+        Start-Sleep -Seconds 5
+    }
+
     $reg = Join-Path $Dir 'kiosk-unlock.reg'
     if (-not (Test-Path $reg)) { Die "kiosk-unlock.reg not found in $Dir" }
     $hive = Get-KioskHive -UserName $KioskUser
@@ -641,15 +651,7 @@ switch ($Mode) {
         Say 'When you are happy, run lockdown-kiosk.cmd to shut Windows out.'
     }
 }
-    # What used to be done by setting the shell. A dedicated stand should
-    # come straight back up after a power cut without anyone reaching
-    # behind the screen; pair this with auto sign-in (netplwiz).
-    $startup = Join-Path ([Environment]::GetFolderPath('CommonStartup')) 'Start Kiosk.lnk'
-    New-Shortcut -Path $startup `
-        -Target $Ahk -Arguments ('"' + (Join-Path $Dir 'kiosk-lock.ahk') + '"') `
-        -WorkDir $Dir -Icon 'shell32.dll,14' `
-        -Description 'Start the ArcGIS kiosk at sign-in.'
-    Say 'the kiosk will start automatically at sign-in'
+
 
 Write-Host ''
 if (-not $Unattended) { Read-Host '  Press Enter to close' | Out-Null }
