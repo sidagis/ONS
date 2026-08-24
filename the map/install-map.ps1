@@ -183,6 +183,17 @@ function Set-TaskbarAutoHide {
 # Windows relaunches it by itself; this is the one-frame black flash.
 function Restart-Explorer {
     Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force
+
+    # AutoRestartShell normally brings it back, but a forced kill does not
+    # always trigger it and the result is a wallpaper with no shell at all.
+    $waited = 0
+    while ($waited -lt 8) {
+        Start-Sleep -Seconds 1
+        $waited++
+        if (Get-Process explorer -ErrorAction SilentlyContinue) { return }
+    }
+    Log "Explorer did not come back on its own - starting it"
+    Start-Process "$env:SystemRoot\explorer.exe"
     Start-Sleep -Seconds 2
 }
 
@@ -279,10 +290,22 @@ if ($Mode -eq "Unlock") {
     Remove-Item $DoneUnlk -Force
     Log "reverting"
 
-    Del-Key "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
-    Del-Key "HKLM:\SOFTWARE\Policies\Microsoft\Windows\EdgeUI"
-    Del-Key "HKLM:\SOFTWARE\Policies\Microsoft\Dsh"
-    Del-Key "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot"
+    # Remove only what Lock set. Deleting the whole Edge policy key took
+    # out anything Intune, Group Policy or the other kiosk had put there.
+    $E = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
+    Del-Key "$E\URLAllowlist"
+    Del-Key "$E\URLBlocklist"
+    foreach ($v in @("DeveloperToolsAvailability","PrintingEnabled","TranslateEnabled",
+                     "BrowserSignin","PasswordManagerEnabled","DefaultNotificationsSetting",
+                     "DefaultGeolocationSetting","DefaultPopupsSetting","AllowSurfGame",
+                     "HideFirstRunExperience","DownloadRestrictions","InPrivateModeAvailability",
+                     "EdgeCollectionsEnabled","ShowRecommendationsEnabled","PromotionalTabsEnabled",
+                     "UserFeedbackAllowed")) { Del-Val $E $v }
+
+    Del-Val "HKLM:\SOFTWARE\Policies\Microsoft\Windows\EdgeUI" "AllowEdgeSwipe"
+    Del-Val "HKLM:\SOFTWARE\Policies\Microsoft\Windows\EdgeUI" "TurnOffBackstack"
+    Del-Val "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests"
+    Del-Val "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot"
 
     Del-Val "$UH\SOFTWARE\Policies\Microsoft\Windows\Explorer" "DisableNotificationCenter"
     Set-Reg "$UH\Software\Microsoft\Windows\CurrentVersion\PushNotifications" "ToastEnabled" 1
@@ -403,17 +426,22 @@ Const TASK_UNLK  = "__TASKUNLOCK__"
 Const USE_MIRROR = __USEMIRROR__
 
 ' --- tuning ---------------------------------------------------------
-Const START_TIMEOUT_MS = 90000   ' how long Edge may take to appear
-Const POLL_MS          = 2000    ' gap between liveness polls
-Const MISSES_TO_CLOSE  = 3       ' consecutive misses = really closed
+Const START_TIMEOUT_MS  = 90000  ' how long Edge may take to appear
+Const POLL_MS           = 5000   ' gap between liveness polls
+Const MISSES_TO_CLOSE   = 2      ' consecutive misses = really gone
+Const RELAUNCH_GAP_MS   = 3000   ' pause before bringing Edge back
+Const MAX_LAUNCH_FAILS  = 5      ' give up and unlock after this many
 
-Dim sh, fso, wmi, profileDir, url, marker, serverPid
+Dim sh, fso, wmi, profileDir, url, marker, serverPid, edgePid
+Dim edgeArgs, stopFlag, fails, running, state, misses
 Set sh  = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
 serverPid  = 0
+edgePid    = 0
 marker     = "onskioskmap"
 profileDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\ONSKioskMap\profile"
+stopFlag   = DIR & "\stop.flag"
 
 Sub Log(msg)
     On Error Resume Next
@@ -426,12 +454,38 @@ End Sub
 ' Returns: 1 = our Edge is running, 0 = not running, -1 = query failed.
 ' A failed query must never be read as "closed", or a WMI hiccup under
 ' load would tear the kiosk down.
+'
+' Enumerating every process and reading its CommandLine is expensive and
+' this runs all day, so the browser PID is resolved once and then polled
+' directly. The full scan only happens on the first poll and after the
+' PID disappears, to confirm it really has gone.
 Function EdgeState()
     Dim procs, p, found
     found = 0
     On Error Resume Next
     Err.Clear
-    Set procs = wmi.ExecQuery("SELECT CommandLine FROM Win32_Process WHERE Name='msedge.exe'")
+
+    If edgePid <> 0 Then
+        Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process " & _
+                                  "WHERE ProcessId=" & edgePid & " AND Name='msedge.exe'")
+        If Err.Number <> 0 Then
+            EdgeState = -1
+            On Error GoTo 0
+            Exit Function
+        End If
+        For Each p In procs
+            found = 1
+        Next
+        If found = 1 Then
+            EdgeState = 1
+            On Error GoTo 0
+            Exit Function
+        End If
+        edgePid = 0
+        Err.Clear
+    End If
+
+    Set procs = wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='msedge.exe'")
     If Err.Number <> 0 Then
         EdgeState = -1
         On Error GoTo 0
@@ -439,7 +493,10 @@ Function EdgeState()
     End If
     For Each p In procs
         If Not IsNull(p.CommandLine) Then
-            If InStr(p.CommandLine, marker) > 0 Then found = 1
+            If InStr(p.CommandLine, marker) > 0 Then
+                found = 1
+                edgePid = p.ProcessId
+            End If
         End If
     Next
     If Err.Number <> 0 Then
@@ -471,6 +528,7 @@ Set wmi = GetObject("winmgmts:\\.\root\cimv2")
 ' ---- 1. lock Windows down ------------------------------------------
 On Error Resume Next
 fso.DeleteFile DIR & "\lock.done", True
+fso.DeleteFile stopFlag, True
 On Error GoTo 0
 
 Log "requesting lockdown"
@@ -502,7 +560,7 @@ If USE_MIRROR Then
     If Err.Number = 0 Then
         If http.status = 200 Then
             Dim body : body = http.responseBody
-            If LenB(body) > 2048 Then
+            If LenB(body) > 2048 And InStr(http.responseText, "portalItemId") > 0 Then
                 Dim st : Set st = CreateObject("ADODB.Stream")
                 st.Type = 1 : st.Open : st.Write body
                 st.SaveToFile MIRROR & "\theMap.html", 2
@@ -548,15 +606,15 @@ End If
 ' ---- 3. launch Edge in THIS session --------------------------------
 ' Our own --user-data-dir means Edge always spawns a separate browser
 ' process, so there is no need to kill anyone else's Edge first.
-KillOurEdge
-WScript.Sleep 500
-
+'
+' The profile is wiped once per SESSION, not once per relaunch: a crash
+' recovery should reuse the warm cache and come back in seconds rather
+' than re-downloading the whole ArcGIS bundle.
 On Error Resume Next
 fso.DeleteFolder profileDir, True
 On Error GoTo 0
 
-Dim args
-args = " --kiosk """ & url & """" & _
+edgeArgs = " --kiosk """ & url & """" & _
        " --edge-kiosk-type=fullscreen" & _
        " --kiosk-idle-timeout-minutes=0" & _
        " --user-data-dir=""" & profileDir & """" & _
@@ -573,47 +631,78 @@ args = " --kiosk """ & url & """" & _
        " --disable-component-update" & _
        " --disable-features=msEdgeSplitScreen,msWebOOUI,msPdfOOUI"
 
-Log "launching Edge"
-sh.Run """" & EDGE & """" & args, 1, False
+' Launch and wait for it to actually appear. Returns True if it did.
+Function LaunchEdge()
+    Dim elapsed
+    KillOurEdge
+    edgePid = 0
+    WScript.Sleep 500
 
-' ---- 4a. wait for Edge to APPEAR -----------------------------------
-Dim elapsed, state, appeared
-elapsed  = 0
-appeared = False
+    Log "launching Edge"
+    sh.Run """" & EDGE & """" & edgeArgs, 1, False
 
-Do While elapsed < START_TIMEOUT_MS
-    WScript.Sleep 1000
-    elapsed = elapsed + 1000
-    state = EdgeState()
-    If state = 1 Then
-        appeared = True
-        Log "Edge is up after " & CStr(elapsed \ 1000) & "s"
+    elapsed = 0
+    Do While elapsed < START_TIMEOUT_MS
+        WScript.Sleep 1000
+        elapsed = elapsed + 1000
+        If EdgeState() = 1 Then
+            Log "Edge is up after " & CStr(elapsed \ 1000) & "s"
+            LaunchEdge = True
+            Exit Function
+        End If
+    Loop
+    LaunchEdge = False
+End Function
+
+' ---- 4. supervise ---------------------------------------------------
+' The old version exited - and unlocked Windows - the moment Edge went
+' away. One crash, one GPU driver reset or one stray Alt+F4 at 10am left
+' the stand showing a Windows desktop for the rest of the day. Now only
+' the Restore Desktop icon ends the session, by writing stop.flag.
+fails = 0
+
+Do
+    If fso.FileExists(stopFlag) Then
+        Log "stop flag - handing the desktop back"
         Exit Do
+    End If
+
+    running = LaunchEdge()
+
+    If Not running Then
+        fails = fails + 1
+        Log "ERROR: Edge did not appear (failure " & CStr(fails) & " of " & CStr(MAX_LAUNCH_FAILS) & ")"
+        If fails >= MAX_LAUNCH_FAILS Then
+            Log "giving up - unlocking so the machine is at least usable"
+            Exit Do
+        End If
+        WScript.Sleep RELAUNCH_GAP_MS
+    Else
+        fails = 0
+        misses = 0
+        Do
+            WScript.Sleep POLL_MS
+            If fso.FileExists(stopFlag) Then Exit Do
+            state = EdgeState()
+            If state = 1 Then
+                misses = 0
+            ElseIf state = 0 Then
+                misses = misses + 1
+            Else
+                Log "WMI query failed, ignoring this poll"
+            End If
+        Loop While misses < MISSES_TO_CLOSE
+
+        If Not fso.FileExists(stopFlag) Then
+            Log "Edge vanished - relaunching"
+            WScript.Sleep RELAUNCH_GAP_MS
+        End If
     End If
 Loop
 
-If Not appeared Then
-    ' Edge genuinely failed to start. Give the desktop back rather than
-    ' leaving the machine locked down with nothing on screen.
-    Log "ERROR: Edge never appeared within " & CStr(START_TIMEOUT_MS \ 1000) & "s - unlocking"
-Else
-    ' ---- 4b. wait for it to close ----------------------------------
-    Dim misses
-    misses = 0
-    Do
-        WScript.Sleep POLL_MS
-        state = EdgeState()
-        If state = 1 Then
-            misses = 0
-        ElseIf state = 0 Then
-            misses = misses + 1
-        Else
-            Log "WMI query failed, ignoring this poll"
-        End If
-    Loop While misses < MISSES_TO_CLOSE
-
-    Log "Edge closed"
-End If
+On Error Resume Next
+fso.DeleteFile stopFlag, True
+On Error GoTo 0
 
 ' ---- 5. give the desktop back --------------------------------------
 If serverPid <> 0 Then
@@ -645,6 +734,22 @@ $vbs = $vbs.Replace("__URL__", $Url).
 $vbsPath = Join-Path $InstallDir "start-map.vbs"
 Set-Content -Path $vbsPath -Value $vbs -Encoding ASCII
 Step "Wrote start-map.vbs (URL is editable in this file)"
+
+# The supervisor relaunches Edge on any exit, so ending a session has to
+# be explicit. This is what the Restore Desktop icon runs.
+$stopCmd = @'
+@echo off
+rem stop-map.cmd - generated by install-map.ps1
+rem Ends a kiosk session: the supervisor sees the flag within one poll,
+rem closes its Edge and unlocks. The schtasks line is a belt-and-braces
+rem unlock in case the supervisor is not running at all.
+echo stop > "__INSTALLDIR__\stop.flag"
+schtasks /run /tn "__TASKUNLOCK__" >nul 2>&1
+'@
+$stopCmd  = $stopCmd.Replace("__INSTALLDIR__", $InstallDir).Replace("__TASKUNLOCK__", $TaskUnlock)
+$stopPath = Join-Path $InstallDir "stop-map.cmd"
+Set-Content -Path $stopPath -Value $stopCmd -Encoding ASCII
+Step "Wrote stop-map.cmd"
 
 # =====================================================================
 #  SCHEDULED TASKS - registry work only, no GUI
@@ -716,8 +821,8 @@ $s.WindowStyle      = 7
 $s.Save()
 
 $r = $wsh.CreateShortcut($lnkRestore)
-$r.TargetPath       = "$env:SystemRoot\System32\schtasks.exe"
-$r.Arguments        = "/run /tn ""$TaskUnlock"""
+$r.TargetPath       = "$env:SystemRoot\System32\cmd.exe"
+$r.Arguments        = "/c ""$stopPath"""
 $r.WorkingDirectory = $InstallDir
 $r.IconLocation     = "$env:SystemRoot\System32\shell32.dll,220"
 $r.Description      = "Unlock Windows if a kiosk session was interrupted"
