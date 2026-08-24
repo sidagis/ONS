@@ -36,6 +36,8 @@ global exiting := false
 global mediaLastSeen := 0          ; tick count when a video was last detected
 global mediaWhy := ""              ; which detector saw it
 global lastResetHow := "-"         ; diagnostics
+global lastResetAt := 0
+global prewarmPending := 0         ; when a post-reset standby build is due
 
 ; The kiosk injects mouse clicks and keystrokes of its own, and Windows
 ; counts those as user input. So idle time is tracked here rather than
@@ -77,6 +79,11 @@ if (CFG["ClearProfileOnStart"])
     try DirDelete CFG["UserDataDir"], true
 StartEdge()
 
+if (CFG["FastReset"] && USES_WRAPPER && CFG["PrewarmAfterReset"]) {
+    warmSent := true
+    prewarmPending := A_TickCount + 45000     ; after the first load has settled
+}
+
 if (CFG["BlockAllKeys"])
     InstallKeyBlocks()
 
@@ -85,6 +92,7 @@ SetTimer EdgeWatch, 3000
 SetTimer MotionTick, CFG["MotionSampleMs"]
 
 BuildTrayMenu()
+LogLockdownCheck()
 return
 
 ; =====================================================================
@@ -120,6 +128,7 @@ LoadConfig() {
 
     c["FastReset"]           := NumOr(IniRead(INI, "Kiosk", "FastReset", 1), 1)
     c["PrewarmSeconds"]      := NumOr(IniRead(INI, "Kiosk", "PrewarmSeconds", 12), 12)
+    c["PrewarmAfterReset"]   := NumOr(IniRead(INI, "Kiosk", "PrewarmAfterReset", 1), 1)
     c["ResetFallback"]       := NumOr(IniRead(INI, "Kiosk", "ResetFallback", 0), 0)
     c["WrapperDebug"]        := NumOr(IniRead(INI, "Kiosk", "WrapperDebug", 0), 0)
     c["IdleReloadMinutes"]   := NumOr(IniRead(INI, "Kiosk", "IdleReloadMinutes", 30), 30)
@@ -283,7 +292,7 @@ IdleMs() {
 ; =====================================================================
 IdleWatch() {
     global CFG, exiting, mediaLastSeen, mediaWhy, lastRealInput, warmSent, USES_WRAPPER
-    global inputSinceReset, houseKept
+    global inputSinceReset, houseKept, lastResetAt, motionPct, prewarmPending
     static fired := false
 
     if (exiting)
@@ -301,6 +310,14 @@ IdleWatch() {
 
     idle := IdleMs()
 
+    ; A build queued for just after a reset: the kiosk is unattended and
+    ; nothing is playing, which is the safest possible moment for it.
+    if (prewarmPending && A_TickCount >= prewarmPending && why = "") {
+        prewarmPending := 0
+        LogLine("standby build requested (after reset)")
+        TapZone("warm", false)
+    }
+
     ; Start loading the standby copy shortly before the reset is due - but
     ; never while a video is playing. A second copy of the Experience means
     ; a second video player, and Vimeo pauses one player when another
@@ -311,10 +328,11 @@ IdleWatch() {
     ; This sits outside the idle branch on purpose, so that when a long
     ; video finally ends the prewarm can still start during the hold, using
     ; PostVideoSeconds as its head start.
-    if (CFG["FastReset"] && USES_WRAPPER && !warmSent && inputSinceReset
-        && why = ""
+    if (CFG["FastReset"] && USES_WRAPPER && !CFG["PrewarmAfterReset"] && !warmSent
+        && inputSinceReset && why = ""
         && idle >= (CFG["IdleSeconds"] - CFG["PrewarmSeconds"]) * 1000) {
         warmSent := true
+        LogLine("standby build requested (idle " Round(idle / 1000) "s)")
         TapZone("warm", false)        ; posted click only - never move the cursor
     }
 
@@ -347,12 +365,22 @@ IdleWatch() {
 
     if (!fired) {
         fired := true
+        LogLine("RESET at idle " Round(idle / 1000) "s"
+              . " - video last detected " (mediaLastSeen ? Round((A_TickCount - mediaLastSeen) / 1000) "s ago (" mediaWhy ")" : "never")
+              . " - motion " motionPct "% - audio " (CFG["HoldForAudio"] ? (EdgeAudioActive() ? "playing" : "quiet") : "off"))
         mediaLastSeen := 0
         mediaWhy := ""
         ResetApp()
+        lastResetAt := A_TickCount
         lastRealInput := A_TickCount     ; the idle clock restarts now
         inputSinceReset := false
-        warmSent := false
+
+        if (CFG["FastReset"] && USES_WRAPPER && CFG["PrewarmAfterReset"]) {
+            warmSent := true                        ; the idle-based build must not also fire
+            prewarmPending := A_TickCount + 3000    ; let the swap settle first
+        } else {
+            warmSent := false
+        }
     }
 }
 
@@ -679,6 +707,7 @@ HardReload() {
     }
     SendInput "{F5}"
     Injecting()
+    LogLine("full page reload (F5)")
     lastResetHow := "reload"
 }
 
@@ -730,6 +759,7 @@ EdgeWatch() {
     if (exiting)
         return
     if (!ProcessExist("msedge.exe")) {
+        LogLine("Edge is not running - relaunching")
         Sleep 800
         StartEdge()
     }
@@ -737,6 +767,7 @@ EdgeWatch() {
 
 StartEdge() {
     global EDGE_EXE, EDGE_ARGS
+    LogLine("starting Edge")
     try Run '"' EDGE_EXE '" ' EDGE_ARGS
     catch as e
         MsgBox "Could not start Edge:`n`n" e.Message, "Kiosk", 0x10
@@ -748,16 +779,101 @@ KillStaleEdge() {
 }
 
 KeepAwake() {
-    ; Silently does nothing if not elevated - the installer already
-    ; applied these once with admin rights.
+    ; Two belts. powercfg covers the active power scheme, and the DC
+    ; entries matter as much as AC: on anything battery-capable the DC
+    ; timeouts still apply while the machine sits on a stand, which is how
+    ; a kiosk that never slept on a desk starts going black in the field.
     try RunWait A_ComSpec ' /c powercfg /change monitor-timeout-ac 0'
+                        . ' & powercfg /change monitor-timeout-dc 0'
                         . ' & powercfg /change standby-timeout-ac 0'
+                        . ' & powercfg /change standby-timeout-dc 0'
                         . ' & powercfg /change disk-timeout-ac 0'
-                        . ' & powercfg /change hibernate-timeout-ac 0', , "Hide"
+                        . ' & powercfg /change disk-timeout-dc 0'
+                        . ' & powercfg /change hibernate-timeout-ac 0'
+                        . ' & powercfg /change hibernate-timeout-dc 0', , "Hide"
+
+    ; And the belt that does not depend on power schemes at all: tell
+    ; Windows this thread needs the display kept alive. Survives a policy
+    ; change, a scheme switch, or a different scheme being active.
+    NoSleepTick()
+    SetTimer NoSleepTick, 30000
 }
 
-; Named LOGFILE, not LOG: variables and functions share one namespace in
-; AutoHotkey v2, and Log() is the built-in natural logarithm.
+NoSleepTick() {
+    ; ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+    try DllCall("kernel32\\SetThreadExecutionState", "uint", 0x80000003 | 0x2)
+}
+
+; =====================================================================
+;  Lockdown self-check
+; =====================================================================
+; Answers the question "is this machine actually locked down?" without
+; anyone having to be standing in front of it. Runs at every start and
+; writes the result to kiosk-log.txt.
+LockdownIssues() {
+    issues := []
+
+    if ProcessExist("explorer.exe")
+        issues.Push("Explorer is RUNNING - the shell was not replaced for this user, so the taskbar, Start menu and edge swipes all work")
+
+    shell := ""
+    try shell := RegRead("HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Shell")
+    if (shell = "")
+        issues.Push("no kiosk shell set for user " A_UserName " - lockdown was probably applied while signed in as somebody else")
+    else if !InStr(shell, "kiosk-lock")
+        issues.Push("the shell for " A_UserName " is set to something else: " shell)
+
+    v := "missing"
+    try v := RegRead("HKLM\SOFTWARE\Policies\Microsoft\Windows\EdgeUI", "AllowEdgeSwipe")
+    if (v != 0)
+        issues.Push("edge swipe is NOT disabled (AllowEdgeSwipe = " v ") - visitors can swipe in from the screen edges")
+
+    v := "missing"
+    try v := RegRead("HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System", "DisableTaskMgr")
+    if (v != 1)
+        issues.Push("Task Manager is not disabled for " A_UserName)
+
+    v := "missing"
+    try v := RegRead("HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer", "NoWinKeys")
+    if (v != 1)
+        issues.Push("Windows key shortcuts are not disabled for " A_UserName)
+
+    v := "missing"
+    try v := RegRead("HKCU\Software\Microsoft\Wisp\Touch", "TouchMode_hold")
+    if (v != 0)
+        issues.Push("press-and-hold right click is still enabled")
+
+    return issues
+}
+
+LogLockdownCheck() {
+    issues := LockdownIssues()
+    if (issues.Length = 0) {
+        LogLine("lockdown check: all clear")
+        return
+    }
+    LogLine("lockdown check: " issues.Length " problem(s) - THIS MACHINE IS NOT LOCKED DOWN")
+    for i in issues
+        LogLine("   - " i)
+}
+
+ShowLockdownCheck() {
+    issues := LockdownIssues()
+    if (issues.Length = 0) {
+        MsgBox "Everything is applied on this machine, for user " A_UserName ".", "Kiosk - lockdown check", 0x40
+        return
+    }
+    txt := "Signed in as: " A_UserName "`n`nProblems found:`n`n"
+    for i in issues
+        txt .= "  - " i "`n`n"
+    txt .= "Fix: sign in as the account the kiosk runs as, then run`n"
+         . "lockdown-kiosk.cmd and choose option 2.`n`n"
+         . "The per-user settings only apply to whoever is signed in when`n"
+         . "you run it - applying them as an administrator account leaves`n"
+         . "the kiosk account wide open."
+    MsgBox txt, "Kiosk - lockdown check", 0x30
+}
+
 LogLine(text) {
     global LOGFILE
     try FileAppend FormatTime(, "yyyy-MM-dd HH:mm:ss") "  " text "`n", LOGFILE, "UTF-8-RAW"
@@ -775,6 +891,7 @@ BuildTrayMenu() {
     m.Add("Status", (*) => ShowStatus())
     m.Add("Motion meter (30s)", (*) => MotionMeter())
     m.Add("Audio sessions", (*) => ShowAudioSessions())
+    m.Add("Lockdown check", (*) => ShowLockdownCheck())
     m.Add("Mark video area", (*) => MarkVideoArea())
     m.Add()
     m.Add("Reset app now", (*) => ResetApp())
@@ -788,7 +905,7 @@ BuildTrayMenu() {
 }
 
 ShowStatus() {
-    global CFG, mediaLastSeen, mediaWhy, lastResetHow, USES_WRAPPER, inputSinceReset, warmSent
+    global CFG, mediaLastSeen, mediaWhy, lastResetHow, USES_WRAPPER, inputSinceReset, warmSent, lastResetAt, prewarmPending
     live := DetectVideo()
     ago := mediaLastSeen ? Round((A_TickCount - mediaLastSeen) / 1000) " s ago" : "never"
     tok := ResetToken()
@@ -807,10 +924,14 @@ ShowStatus() {
         . (CFG["FastReset"] && USES_WRAPPER && !CFG["ResetFallback"] ? ", unverified (no reload fallback)" : "") "`n"
         . "  visitor since:  " (inputSinceReset ? "yes - a reset is due when idle" : "no - already on the front page") "`n"
         . "  standby copy:   " (!CFG["FastReset"] || !USES_WRAPPER ? "not used"
-                              : warmSent ? "requested" : live != "" ? "held back - video playing" : "not requested yet") "`n"
+                              : prewarmPending ? "queued, building shortly"
+                              : warmSent ? "requested"
+                              : live != "" ? "held back - video playing" : "not requested yet") "`n"
         . "  ack pixel:      " (AckPixel() != "" ? AckPixel() " (this is what confirms a swap)" : "unreadable") "`n"
         . "  wrapper token:  " (tok != "" ? tok : "not visible (harmless, the pixel is the real channel)") "`n"
         . "  last reset via: " lastResetHow
+        . "`n  last reset:     " (lastResetAt ? Round((A_TickCount - lastResetAt) / 1000) " s ago" : "not yet this session")
+        . "`n`nEvery reset is logged with the reason to kiosk-log.txt."
         , "Kiosk status", 0x40
 }
 

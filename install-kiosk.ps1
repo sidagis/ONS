@@ -29,7 +29,7 @@ param(
     [string]$AppUrl,
     [int]$IdleSeconds = 0,
 
-    [ValidateSet('Install','Lockdown','Unlock')]
+    [ValidateSet('Install','Lockdown','Unlock','Verify')]
     [string]$Mode = 'Install',
 
     # Lockdown only: also make the kiosk the Windows shell for this user,
@@ -298,6 +298,16 @@ function Invoke-Lockdown {
     $reg = Join-Path $Dir 'kiosk-lockdown.reg'
     if (-not (Test-Path $reg)) { Die "kiosk-lockdown.reg not found in $Dir - run the installer first" }
 
+    Write-Host ''
+    Warn "These settings apply to the account signed in RIGHT NOW: $env:USERNAME"
+    Warn 'If that is not the account the kiosk runs as, stop and sign in as'
+    Warn 'that account first, or the kiosk will not be locked down at all.'
+    Write-Host ''
+    if (-not $Unattended) {
+        $go = Read-Host "  Is $env:USERNAME the account the kiosk runs as? (y/n)"
+        if ($go -notmatch '^[yY]') { Die 'Stopped. Sign in as the kiosk account and run this again.' }
+    }
+
     Step 'Applying Windows and Edge restrictions'
     reg import $reg 2>&1 | Out-Null
     Say 'policies imported'
@@ -341,6 +351,55 @@ function Invoke-Lockdown {
     Warn 'in the locked cabinet - see the notes in SETUP.md.'
 }
 
+# Reports whether this machine is actually locked down, for the account
+# currently signed in. The per-user settings are the ones that get missed.
+function Invoke-Verify {
+    param([string]$Dir)
+
+    Step "Checking lockdown for $env:USERNAME"
+    $problems = @()
+
+    if (Get-Process explorer -ErrorAction SilentlyContinue) {
+        $problems += 'Explorer is RUNNING - the shell was not replaced for this user. Taskbar, Start menu and edge swipes all work.'
+    }
+
+    $shell = (Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name Shell -ErrorAction SilentlyContinue).Shell
+    if (-not $shell)                      { $problems += "no kiosk shell set for $env:USERNAME" }
+    elseif ($shell -notmatch 'kiosk-lock'){ $problems += "the shell for $env:USERNAME is something else: $shell" }
+
+    $checks = @(
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\EdgeUI'; Name='AllowEdgeSwipe'; Want=0; What='edge swipe from the screen sides' },
+        @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System'; Name='DisableTaskMgr'; Want=1; What='Task Manager' },
+        @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name='NoWinKeys'; Want=1; What='Windows key shortcuts' },
+        @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System'; Name='DisableLockWorkstation'; Want=1; What='Win+L lock' },
+        @{ Path='HKCU:\Software\Microsoft\Wisp\Touch'; Name='TouchMode_hold'; Want=0; What='press-and-hold right click' }
+    )
+    foreach ($c in $checks) {
+        $v = (Get-ItemProperty $c.Path -Name $c.Name -ErrorAction SilentlyContinue).$($c.Name)
+        if ($null -eq $v)      { $problems += "$($c.What): policy missing" }
+        elseif ($v -ne $c.Want){ $problems += "$($c.What): set to $v, should be $($c.Want)" }
+    }
+
+    $allow = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\URLAllowlist' -ErrorAction SilentlyContinue
+    if (-not $allow) { $problems += 'Edge URL allow list not set - the browser can reach anywhere' }
+
+    Write-Host ''
+    if ($problems.Count -eq 0) {
+        Write-Host '  All clear on this machine, for this user.' -ForegroundColor Green
+    } else {
+        Write-Host "  $($problems.Count) problem(s) - THIS MACHINE IS NOT LOCKED DOWN" -ForegroundColor Red
+        Write-Host ''
+        foreach ($p in $problems) { Write-Host "   - $p" -ForegroundColor Yellow }
+        Write-Host ''
+        Say 'The per-user settings only apply to whoever is signed in when'
+        Say 'you run the lockdown. Applying them from an administrator'
+        Say 'account leaves the kiosk account untouched.'
+        Say ''
+        Say "Fix: sign in AS THE KIOSK ACCOUNT, then run lockdown-kiosk.cmd"
+        Say 'and choose option 2.'
+    }
+}
+
 function Invoke-Unlock {
     param([string]$Dir)
     $reg = Join-Path $Dir 'kiosk-unlock.reg'
@@ -368,6 +427,10 @@ switch ($Mode) {
 
     'Unlock' {
         Invoke-Unlock -Dir $InstallDir
+    }
+
+    'Verify' {
+        Invoke-Verify -Dir $InstallDir
     }
 
     'Lockdown' {

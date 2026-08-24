@@ -42,15 +42,17 @@ echo.
 echo   1  Lock the machine down  (Windows + Edge restrictions)
 echo   2  Lock down AND stop Explorer from starting  (full kiosk)
 echo   3  Remove all restrictions  (maintenance)
-echo   4  Cancel
+echo   4  CHECK what is actually applied on this machine
+echo   5  Cancel
 echo.
 set "PICK="
-set /p "PICK=  Choose 1-4: "
+set /p "PICK=  Choose 1-5: "
 
 if "%PICK%"=="1" goto lock
 if "%PICK%"=="2" goto lockshell
 if "%PICK%"=="3" goto unlock
-if "%PICK%"=="4" goto :eof
+if "%PICK%"=="4" goto verify
+if "%PICK%"=="5" goto :eof
 goto menu
 
 :lock
@@ -66,6 +68,10 @@ echo.
 choice /c YN /m "  Continue"
 if errorlevel 2 goto menu
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Lockdown -SetShell -InstallDir "%INSTALLDIR%"
+goto :eof
+
+:verify
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode Verify -InstallDir "%INSTALLDIR%"
 goto :eof
 
 :unlock
