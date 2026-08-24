@@ -981,15 +981,18 @@ ExplorerInThisSession() {
 LockdownIssues() {
     issues := []
 
-    if ExplorerInThisSession()
-        issues.Push("Explorer is RUNNING - the shell was not replaced for this user, so the taskbar, Start menu and edge swipes all work")
+    global CFG
 
-    shell := ""
-    try shell := RegRead("HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Shell")
-    if (shell = "")
-        issues.Push("no kiosk shell set for user " A_UserName " - lockdown was probably applied while signed in as somebody else")
-    else if !InStr(shell, "kiosk-lock")
-        issues.Push("the shell for " A_UserName " is set to something else: " shell)
+    if ExplorerInThisSession()
+        issues.Push("Explorer is RUNNING in this session - the taskbar, Start menu and edge swipes are all reachable")
+
+    if !FileExist(A_ScriptDir "\lock.done")
+        issues.Push("the lock task did not confirm - check that '" CFG["TaskLock"] "' is registered and that this account may run it")
+
+    v := "missing"
+    try v := RegRead("HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "AutoRestartShell")
+    if (v != 0)
+        issues.Push("AutoRestartShell is " v " - Windows will relaunch Explorer as fast as the kiosk can kill it")
 
     v := "missing"
     try v := RegRead("HKLM\SOFTWARE\Policies\Microsoft\Windows\EdgeUI", "AllowEdgeSwipe")
