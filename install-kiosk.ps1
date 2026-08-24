@@ -53,6 +53,8 @@ $ErrorActionPreference = 'Stop'
 $PAYLOAD = @(
     'kiosk-lock.ahk',
     'kiosk-wrapper.html',
+    'kiosk-session.ps1',
+    'restore-desktop.cmd',
     'kiosk-lockdown.reg',
     'kiosk-unlock.reg',
     'install-kiosk.ps1',
@@ -276,6 +278,13 @@ function Add-Shortcuts {
             -Target 'notepad.exe' -Arguments ('"' + (Join-Path $Dir 'kiosk.ini') + '"') `
             -WorkDir $Dir -Icon 'notepad.exe,0' `
             -Description 'Change the app URL and the reset timer.'
+
+        New-Shortcut -Path (Join-Path $t 'Restore Desktop.lnk') `
+            -Target "$env:SystemRoot\System32\cmd.exe" `
+            -Arguments ('/c "' + (Join-Path $Dir 'restore-desktop.cmd') + '"') `
+            -WorkDir $Dir -Icon 'shell32.dll,220' `
+            -Description 'Unlock Windows if a kiosk session was interrupted.'
+    }
     }
     Say "shortcuts created on the desktop and under Start > Kiosk"
 }
@@ -496,6 +505,12 @@ function Invoke-Verify {
 }
 
 function Invoke-Unlock {
+    # Revert a live session first, in case one is running.
+    foreach ($n in 'ONS Kiosk Lock','ONS Kiosk Unlock','ONS Kiosk Recover') {
+        if (Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue) {
+            if ($n -eq 'ONS Kiosk Unlock') { Start-ScheduledTask -TaskName $n; Start-Sleep -Seconds 5 }
+        }
+    }
     param([string]$Dir)
     $reg = Join-Path $Dir 'kiosk-unlock.reg'
     if (-not (Test-Path $reg)) { Die "kiosk-unlock.reg not found in $Dir" }
@@ -508,6 +523,60 @@ function Invoke-Unlock {
     reg delete 'HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization' /v NoLockScreen /f 2>&1 | Out-Null
     Say 'Explorer will start normally at the next sign-in'
     Say 'sign out and back in, or reboot, to finish'
+}
+# ---------------------------------------------------------------------
+#  Scheduled tasks
+# ---------------------------------------------------------------------
+# The lockdown runs as SYSTEM so it can write HKLM policy, stop services
+# and reach the signed-in user's hive. The kiosk controller triggers
+# these; it needs no admin rights of its own.
+function Register-SessionTasks {
+    param([string]$Dir)
+
+    $script = Join-Path $Dir 'kiosk-session.ps1'
+    if (-not (Test-Path $script)) { Die "kiosk-session.ps1 is missing from $Dir" }
+
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                    -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew
+
+    $tasks = @(
+        @{ Name = 'ONS Kiosk Lock';    Mode = 'Lock';    Trigger = $null },
+        @{ Name = 'ONS Kiosk Unlock';  Mode = 'Unlock';  Trigger = $null },
+        @{ Name = 'ONS Kiosk Recover'; Mode = 'Recover'; Trigger = (New-ScheduledTaskTrigger -AtLogOn) }
+    )
+
+    foreach ($t in $tasks) {
+        Unregister-ScheduledTask -TaskName $t.Name -Confirm:$false -ErrorAction SilentlyContinue
+        $action = New-ScheduledTaskAction `
+            -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script`" -Mode $($t.Mode) -Dir `"$Dir`""
+
+        if ($t.Trigger) {
+            Register-ScheduledTask -TaskName $t.Name -Action $action -Principal $principal `
+                -Settings $settings -Trigger $t.Trigger | Out-Null
+        } else {
+            Register-ScheduledTask -TaskName $t.Name -Action $action -Principal $principal `
+                -Settings $settings | Out-Null
+        }
+    }
+    Say 'registered ONS Kiosk Lock / Unlock / Recover (SYSTEM, no UAC prompt)'
+
+    # A standard stand account must be able to trigger Lock and Unlock, or
+    # schtasks /run is denied and the kiosk silently runs unlocked.
+    try {
+        $svc = New-Object -ComObject Schedule.Service
+        $svc.Connect()
+        $folder = $svc.GetFolder('\')
+        $sddl = 'D:(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;AU)'
+        foreach ($n in 'ONS Kiosk Lock','ONS Kiosk Unlock') {
+            $folder.GetTask($n).SetSecurityDescriptor($sddl, 0)
+        }
+        Say 'task permissions widened so a standard user can trigger them'
+    } catch {
+        Warn "could not widen task permissions: $($_.Exception.Message)"
+        Warn 'the kiosk account will need to be an administrator, or the lockdown will not apply'
+    }
 }
 
 # =====================================================================
@@ -554,6 +623,9 @@ switch ($Mode) {
         Step 'Power settings'
         Set-Power
 
+        Step 'Lockdown tasks'
+        Register-SessionTasks -Dir $InstallDir
+
         Step 'Shortcuts'
         Add-Shortcuts -Dir $InstallDir -Ahk $ahk
 
@@ -569,6 +641,15 @@ switch ($Mode) {
         Say 'When you are happy, run lockdown-kiosk.cmd to shut Windows out.'
     }
 }
+    # What used to be done by setting the shell. A dedicated stand should
+    # come straight back up after a power cut without anyone reaching
+    # behind the screen; pair this with auto sign-in (netplwiz).
+    $startup = Join-Path ([Environment]::GetFolderPath('CommonStartup')) 'Start Kiosk.lnk'
+    New-Shortcut -Path $startup `
+        -Target $Ahk -Arguments ('"' + (Join-Path $Dir 'kiosk-lock.ahk') + '"') `
+        -WorkDir $Dir -Icon 'shell32.dll,14' `
+        -Description 'Start the ArcGIS kiosk at sign-in.'
+    Say 'the kiosk will start automatically at sign-in'
 
 Write-Host ''
 if (-not $Unattended) { Read-Host '  Press Enter to close' | Out-Null }
