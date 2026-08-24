@@ -38,6 +38,9 @@ global mediaWhy := ""              ; which detector saw it
 global lastResetHow := "-"         ; diagnostics
 global lastResetAt := 0
 global prewarmPending := 0         ; when a post-reset standby build is due
+global resetsSinceRestart := 0     ; swaps done since Edge was last restarted
+global restarting := false
+global lastNightly := ""           ; date of the last scheduled restart
 
 ; The kiosk injects mouse clicks and keystrokes of its own, and Windows
 ; counts those as user input. So idle time is tracked here rather than
@@ -132,6 +135,9 @@ LoadConfig() {
     c["ResetFallback"]       := NumOr(IniRead(INI, "Kiosk", "ResetFallback", 0), 0)
     c["WrapperDebug"]        := NumOr(IniRead(INI, "Kiosk", "WrapperDebug", 0), 0)
     c["IdleReloadMinutes"]   := NumOr(IniRead(INI, "Kiosk", "IdleReloadMinutes", 30), 30)
+    c["RestartEveryResets"]  := NumOr(IniRead(INI, "Kiosk", "RestartEveryResets", 25), 25)
+    c["MaxEdgeMemoryMB"]     := NumOr(IniRead(INI, "Kiosk", "MaxEdgeMemoryMB", 2500), 2500)
+    c["NightlyRestart"]      := Trim(IniRead(INI, "Kiosk", "NightlyRestart", "03:30"))
 
     if (c["IdleSeconds"] < 5)                          ; a typo must not brick the kiosk
         c["IdleSeconds"] := 5
@@ -292,7 +298,7 @@ IdleMs() {
 ; =====================================================================
 IdleWatch() {
     global CFG, exiting, mediaLastSeen, mediaWhy, lastRealInput, warmSent, USES_WRAPPER
-    global inputSinceReset, houseKept, lastResetAt, motionPct, prewarmPending
+    global inputSinceReset, houseKept, lastResetAt, motionPct, prewarmPending, resetsSinceRestart
     static fired := false
 
     if (exiting)
@@ -365,12 +371,18 @@ IdleWatch() {
 
     if (!fired) {
         fired := true
-        LogLine("RESET at idle " Round(idle / 1000) "s"
+        resetsSinceRestart++
+        LogLine("RESET #" resetsSinceRestart " at idle " Round(idle / 1000) "s"
+              . " - Edge using " EdgeMemoryMB() " MB"
               . " - video last detected " (mediaLastSeen ? Round((A_TickCount - mediaLastSeen) / 1000) "s ago (" mediaWhy ")" : "never")
               . " - motion " motionPct "% - audio " (CFG["HoldForAudio"] ? (EdgeAudioActive() ? "playing" : "quiet") : "off"))
         mediaLastSeen := 0
         mediaWhy := ""
-        ResetApp()
+        if (RestartDue())
+            RestartEdge()
+        else
+            ResetApp()
+
         lastResetAt := A_TickCount
         lastRealInput := A_TickCount     ; the idle clock restarts now
         inputSinceReset := false
@@ -754,10 +766,79 @@ TapZone(which, realClick := true) {
 ; =====================================================================
 ;  Watchdog and housekeeping
 ; =====================================================================
-EdgeWatch() {
-    global exiting
-    if (exiting)
+; =====================================================================
+;  Periodic restarts
+; =====================================================================
+; Fast reset keeps one wrapper document alive all day and only swaps
+; iframes inside it. That is what makes resets instant, but it also means
+; anything the app leaks accumulates for the whole day - the old F5-based
+; reset used to clear that out dozens of times a day as a side effect.
+; These restarts put that hygiene back, at moments when nobody is there.
+
+EdgeMemoryMB() {
+    total := 0
+    try {
+        for proc in ComObjGet("winmgmts:\\.\root\cimv2").ExecQuery("SELECT WorkingSetSize FROM Win32_Process WHERE Name='msedge.exe'")
+            total += proc.WorkingSetSize
+    }
+    return Round(total / 1048576)
+}
+
+RestartDue() {
+    global CFG, resetsSinceRestart
+    if (CFG["RestartEveryResets"] > 0 && resetsSinceRestart >= CFG["RestartEveryResets"])
+        return true
+    if (CFG["MaxEdgeMemoryMB"] > 0 && EdgeMemoryMB() > CFG["MaxEdgeMemoryMB"])
+        return true
+    return false
+}
+
+; A restart takes several seconds and shows the loading screen, so it only
+; ever happens in place of a reset - that is, with nobody at the screen.
+RestartEdge() {
+    global CFG, resetsSinceRestart, restarting, warmSent, prewarmPending, lastResetHow, USES_WRAPPER
+
+    restarting := true
+    LogLine("restarting Edge - " resetsSinceRestart " resets, " EdgeMemoryMB() " MB in use")
+
+    try ProcessClose "msedge.exe"
+    Sleep 1500
+    try ProcessClose "msedge.exe"
+    Sleep 500
+    StartEdge()
+
+    resetsSinceRestart := 0
+    lastResetHow := "Edge restart"
+    warmSent := false
+    prewarmPending := 0
+    if (CFG["FastReset"] && USES_WRAPPER && CFG["PrewarmAfterReset"]) {
+        warmSent := true
+        prewarmPending := A_TickCount + 45000
+    }
+    restarting := false
+}
+
+; Scheduled restart, for stands that are busy enough that the reset-count
+; and memory triggers never fire during opening hours.
+NightlyCheck() {
+    global CFG, lastNightly, exiting, restarting
+    if (exiting || restarting || CFG["NightlyRestart"] = "")
         return
+    today := FormatTime(, "yyyy-MM-dd")
+    if (lastNightly = today)
+        return
+    if (FormatTime(, "HH:mm") != CFG["NightlyRestart"])
+        return
+    lastNightly := today
+    LogLine("scheduled restart at " CFG["NightlyRestart"])
+    RestartEdge()
+}
+
+EdgeWatch() {
+    global exiting, restarting
+    if (exiting || restarting)
+        return
+    NightlyCheck()
     if (!ProcessExist("msedge.exe")) {
         LogLine("Edge is not running - relaunching")
         Sleep 800
@@ -896,6 +977,7 @@ BuildTrayMenu() {
     m.Add()
     m.Add("Reset app now", (*) => ResetApp())
     m.Add("Hard reload now", (*) => HardReload())
+    m.Add("Restart Edge now", (*) => RestartEdge())
     m.Add("Mute output again", (*) => MuteOutput())
     m.Add("Edit kiosk.ini", (*) => Run('notepad.exe "' INI '"'))
     m.Add()
@@ -905,7 +987,7 @@ BuildTrayMenu() {
 }
 
 ShowStatus() {
-    global CFG, mediaLastSeen, mediaWhy, lastResetHow, USES_WRAPPER, inputSinceReset, warmSent, lastResetAt, prewarmPending
+    global CFG, mediaLastSeen, mediaWhy, lastResetHow, USES_WRAPPER, inputSinceReset, warmSent, lastResetAt, prewarmPending, resetsSinceRestart
     live := DetectVideo()
     ago := mediaLastSeen ? Round((A_TickCount - mediaLastSeen) / 1000) " s ago" : "never"
     tok := ResetToken()
@@ -931,6 +1013,8 @@ ShowStatus() {
         . "  wrapper token:  " (tok != "" ? tok : "not visible (harmless, the pixel is the real channel)") "`n"
         . "  last reset via: " lastResetHow
         . "`n  last reset:     " (lastResetAt ? Round((A_TickCount - lastResetAt) / 1000) " s ago" : "not yet this session")
+        . "`n  resets so far:  " resetsSinceRestart " since Edge last restarted (restart at " CFG["RestartEveryResets"] ")"
+        . "`n  Edge memory:    " EdgeMemoryMB() " MB (restart above " CFG["MaxEdgeMemoryMB"] " MB)"
         . "`n`nEvery reset is logged with the reason to kiosk-log.txt."
         , "Kiosk status", 0x40
 }
