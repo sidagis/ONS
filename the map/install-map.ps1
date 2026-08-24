@@ -568,11 +568,26 @@ Sub KillOurEdge()
 End Sub
 
 Sub KillExplorer()
-    Dim procs, p
+    ' Only this session's shell. Killing every explorer.exe on the box
+    ' takes out any other signed-in user's desktop too, and with
+    ' AutoRestartShell=0 it does not come back.
+    Dim procs, p, mySession, me
     On Error Resume Next
-    Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='explorer.exe'")
+    Set me = wmi.Get("Win32_Process.Handle='" & _
+             CreateObject("WScript.Shell").Exec("cmd /c exit").ProcessID & "'")
+    mySession = -1
+    Set procs = wmi.ExecQuery("SELECT SessionId FROM Win32_Process WHERE Name='wscript.exe'")
     For Each p In procs
-        sh.Run "taskkill /F /PID " & p.ProcessId, 0, True
+        mySession = p.SessionId
+        Exit For
+    Next
+    If mySession < 0 Then
+        Log "could not determine this session - NOT killing Explorer"
+        Exit Sub
+    End If
+    Set procs = wmi.ExecQuery("SELECT ProcessId, SessionId FROM Win32_Process WHERE Name='explorer.exe'")
+    For Each p In procs
+        If p.SessionId = mySession Then sh.Run "taskkill /F /PID " & p.ProcessId, 0, True
     Next
     On Error GoTo 0
 End Sub
