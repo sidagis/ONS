@@ -5798,70 +5798,7 @@ window.addEventListener("contextmenu", function (e) {
       function setBusy(on) { busyEl.classList.toggle("show", !!on); }
 
 
-      function installPointerCorrection(view) {
-        const scaler = document.getElementById("viewScaler");
-
-        const target = view.container.querySelector("canvas") || view.container;
-
-        const TYPES = ["pointerdown", "pointermove", "pointerup",
-          "pointercancel", "pointerleave", "pointerenter"];
-
-        TYPES.forEach(function (type) {
-          scaler.addEventListener(type, function (e) {
-            // Only correct events that originated from real input, not our own clones.
-            if (e.__corrected) return;
-
-            const rect = scaler.getBoundingClientRect(); // displayed (scaled) box
-            // Position within the displayed box, divided back to rendered space:
-            const localX = (e.clientX - rect.left) / SCALE;
-            const localY = (e.clientY - rect.top) / SCALE;
-
-            // Build a corrected event with rendered-space coordinates.
-            const corrected = new PointerEvent(type, {
-              bubbles: true,
-              cancelable: true,
-              composed: true,
-              pointerId: e.pointerId,
-              pointerType: e.pointerType,
-              isPrimary: e.isPrimary,
-              button: e.button,
-              buttons: e.buttons,
-              width: e.width,
-              height: e.height,
-              pressure: e.pressure,
-              clientX: rect.left + localX,   // place back near origin, unscaled
-              clientY: rect.top + localY,
-              screenX: e.screenX,
-              screenY: e.screenY,
-              ctrlKey: e.ctrlKey, shiftKey: e.shiftKey,
-              altKey: e.altKey, metaKey: e.metaKey
-            });
-            corrected.__corrected = true;
-
-            e.stopImmediatePropagation();
-            e.preventDefault();
-            target.dispatchEvent(corrected);
-          }, true); // capture phase
-        });
-
-        // scaler incase we need to scale the script using css.
-        scaler.addEventListener("wheel", function (e) {
-          if (e.__corrected) return;
-          const rect = scaler.getBoundingClientRect();
-          const localX = (e.clientX - rect.left) / SCALE;
-          const localY = (e.clientY - rect.top) / SCALE;
-          const corrected = new WheelEvent("wheel", {
-            bubbles: true, cancelable: true, composed: true,
-            deltaX: e.deltaX, deltaY: e.deltaY, deltaMode: e.deltaMode,
-            clientX: rect.left + localX, clientY: rect.top + localY,
-            ctrlKey: e.ctrlKey, shiftKey: e.shiftKey
-          });
-          corrected.__corrected = true;
-          e.stopImmediatePropagation();
-          e.preventDefault();
-          target.dispatchEvent(corrected);
-        }, true);
-      }
+      
 
       const webmap = new WebMap({
         portalItem: { id: CONFIG.portalItemId }
@@ -5872,15 +5809,13 @@ window.addEventListener("contextmenu", function (e) {
         container: "viewDiv",
         map: webmap,
         // Disable popups entirely — navigation only.
-        popup: { autoOpenEnabled: true },
+        popup: { autoOpenEnabled: false },
         ui: { components: [] } // keep zoom buttons; drop attribution/etc.
       });
 
 
-     // view.on("click", function (event) { event.stopPropagation(); });
       view.on("double-click", function (event) {
       });
-      window.view = window;
 
       view.when(function () {
 
@@ -5933,6 +5868,7 @@ window.addEventListener("contextmenu", function (e) {
   if (actionRunning) return;
   resetToDefaults();
   view.goTo(initialViewpoint || CONFIG.extents.home, { animate: false }).catch(function () {});
+  interacted = true;
   armIdleTimer();
 });
 
@@ -6276,6 +6212,7 @@ window.addEventListener("contextmenu", function (e) {
           actionRunning = true;
           Promise.resolve(actions[key]()).finally(function () {
             actionRunning = false;
+            interacted = true;
             armIdleTimer();
           });
         });
@@ -6316,29 +6253,63 @@ function hideAttract() {
 }
   
   //       IDLE RESET 
+  //       IDLE RESET
+      // Has anybody used the kiosk since the last reset? Without this the
+      // stand re-runs resetToDefaults() and an animated goTo every 25
+      // seconds all night, thousands of times, for nobody.
+      let interacted = false;
+      let lastLoadAt = Date.now();
+      const RELOAD_AFTER_IDLE_MS = 30 * 60 * 1000;
+
       function armIdleTimer() {
         clearTimeout(idleTimer);
         idleTimer = setTimeout(idleReset, CONFIG.idleMs);
       }
+
       function idleReset() {
         showAttract();
-        resetToDefaults();
-        if (initialViewpoint) {
-          view.goTo(initialViewpoint, { duration: 900 }).catch(function () { });
-        } else {
-          goToExtent(CONFIG.extents.home);
+
+        if (interacted) {
+          interacted = false;
+          resetToDefaults();
+          if (initialViewpoint) {
+            view.goTo(initialViewpoint, { duration: 900 }).catch(function () { });
+          } else {
+            goToExtent(CONFIG.extents.home);
+          }
+        } else if (Date.now() - lastLoadAt > RELOAD_AFTER_IDLE_MS) {
+          // Nobody has touched it since the last reset and this document
+          // has been alive a long time. One full reload as housekeeping -
+          // it can only ever happen with the stand unattended.
+          location.reload();
+          return;
         }
+
         armIdleTimer();
       }
 
-      // Reset idle timer on ANY interaction (touch, mouse, map drag, zoom).
-      ["pointerdown", "pointermove", "wheel", "touchstart", "keydown"]
+      // Reset the idle timer on real interaction. pointermove fires up to
+      // ~120x/s during a pan and each one was doing a clearTimeout, a
+      // setTimeout and a getElementById, so it is throttled.
+      let lastMoveArm = 0;
+
+      function noteInteraction() {
+        interacted = true;
+        armIdleTimer();
+        hideAttract();
+      }
+
+      ["pointerdown", "pointerup", "wheel", "touchstart", "keydown"]
         .forEach(function (evt) {
-          window.addEventListener(evt, function () {
-         armIdleTimer();
-          hideAttract();
-    }, { passive: true });
+          window.addEventListener(evt, noteInteraction, { passive: true });
         });
+
+      window.addEventListener("pointermove", function () {
+        const now = Date.now();
+        if (now - lastMoveArm < 250) return;
+        lastMoveArm = now;
+        noteInteraction();
+      }, { passive: true });
       // Map view interactions (pan/zoom) also count.
       
 
