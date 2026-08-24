@@ -953,25 +953,7 @@ NoSleepTick() {
     ; ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
     try DllCall("kernel32\\SetThreadExecutionState", "uint", 0x80000003 | 0x2)
 }
-; ProcessExist("explorer.exe") is machine-wide. An administrator signed in
-; on a second session made this report a lockdown failure that was not real.
-ExplorerInThisSession() {
-    static mySid := -1
-    if (mySid = -1) {
-        sid := 0
-        DllCall("kernel32\ProcessIdToSessionId"
-              , "uint", DllCall("kernel32\GetCurrentProcessId", "uint")
-              , "uint*", &sid)
-        mySid := sid
-    }
-    try {
-        for p in ComObjGet("winmgmts:\\.\root\cimv2").ExecQuery(
-            "SELECT SessionId FROM Win32_Process WHERE Name='explorer.exe'")
-            if (p.SessionId = mySid)
-                return true
-    }
-    return false
-}
+
 ; =====================================================================
 ;  Lockdown self-check
 ; =====================================================================
