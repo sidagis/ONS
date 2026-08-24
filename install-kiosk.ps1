@@ -41,6 +41,8 @@ param(
 
     # Never prompt; accept defaults.
     [switch]$Unattended
+
+    [string]$KioskUser
 )
 
 $ErrorActionPreference = 'Stop'
@@ -290,6 +292,85 @@ function Set-Power {
 }
 
 # ---------------------------------------------------------------------
+#  Per-user policy, in the RIGHT user's hive
+# ---------------------------------------------------------------------
+# The whole point: reg import of a file full of HKEY_CURRENT_USER keys
+# writes into whichever account UAC elevated us into. If the kiosk runs
+# as a standard user - which is what SETUP.md recommends - that is the
+# administrator, and the kiosk account ends up with no lockdown at all
+# while the admin loses their own Task Manager.
+function Get-KioskHive {
+    param([string]$UserName)
+
+    if ($UserName) {
+        try {
+            $sid = (New-Object Security.Principal.NTAccount($UserName)).Translate(
+                       [Security.Principal.SecurityIdentifier]).Value
+            if (Test-Path "Registry::HKEY_USERS\$sid") {
+                return @{ Path = "Registry::HKEY_USERS\$sid"; Reg = "HKU\$sid"; Name = $UserName }
+            }
+            Warn "$UserName is not signed in, so their registry hive is not loaded."
+            Warn 'Sign in as that account and run this again.'
+        } catch {
+            Warn "could not resolve '$UserName' to a SID: $($_.Exception.Message)"
+        }
+    }
+
+    # Fall back to whoever owns the interactive Explorer.
+    $p = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue |
+         Select-Object -First 1
+    if ($p) {
+        $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner    -ErrorAction SilentlyContinue
+        $osid  = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+        if ($osid.Sid -and (Test-Path "Registry::HKEY_USERS\$($osid.Sid)")) {
+            return @{ Path = "Registry::HKEY_USERS\$($osid.Sid)"
+                      Reg  = "HKU\$($osid.Sid)"
+                      Name = "$($owner.Domain)\$($owner.User)" }
+        }
+    }
+
+    Warn 'Falling back to the hive of the account running this script.'
+    return @{ Path = 'Registry::HKEY_CURRENT_USER'; Reg = 'HKCU'; Name = $env:USERNAME }
+}
+
+function Set-HiveValue {
+    param($Base,[string]$SubKey,[string]$Name,$Value,[string]$Type = 'DWord')
+    $p = Join-Path $Base $SubKey
+    if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
+    New-ItemProperty -Path $p -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+}
+
+function Set-UserPolicies {
+    param($Hive,[bool]$On)
+
+    $B = $Hive.Path
+    $exp = 'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+    $sys = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'
+
+    if ($On) {
+        foreach ($n in 'NoWinKeys','NoRun','NoClose','NoLogoff','NoControlPanel',
+                       'NoSetTaskbar','NoTrayContextMenu','NoViewContextMenu') {
+            Set-HiveValue $B $exp $n 1
+        }
+        foreach ($n in 'DisableTaskMgr','DisableLockWorkstation','DisableChangePassword') {
+            Set-HiveValue $B $sys $n 1
+        }
+        Set-HiveValue $B 'Software\Microsoft\Wisp\Touch' 'TouchMode_hold' 0
+        Set-HiveValue $B 'Software\Microsoft\Windows\CurrentVersion\PushNotifications' 'ToastEnabled' 0
+        Set-HiveValue $B 'Control Panel\Desktop' 'ScreenSaveActive'   '0' 'String'
+        Set-HiveValue $B 'Control Panel\Desktop' 'ScreenSaverIsSecure' '0' 'String'
+        Say "per-user policies applied to $($Hive.Name)"
+    } else {
+        Remove-Item (Join-Path $B $exp) -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $B $sys) -Recurse -Force -ErrorAction SilentlyContinue
+        Set-HiveValue $B 'Software\Microsoft\Wisp\Touch' 'TouchMode_hold' 1
+        Set-HiveValue $B 'Software\Microsoft\Windows\CurrentVersion\PushNotifications' 'ToastEnabled' 1
+        Set-HiveValue $B 'Control Panel\Desktop' 'ScreenSaveActive' '1' 'String'
+        Say "per-user policies removed from $($Hive.Name)"
+    }
+}
+
+# ---------------------------------------------------------------------
 #  Lockdown
 # ---------------------------------------------------------------------
 function Invoke-Lockdown {
@@ -298,19 +379,20 @@ function Invoke-Lockdown {
     $reg = Join-Path $Dir 'kiosk-lockdown.reg'
     if (-not (Test-Path $reg)) { Die "kiosk-lockdown.reg not found in $Dir - run the installer first" }
 
+    $hive = Get-KioskHive -UserName $KioskUser
+
     Write-Host ''
-    Warn "These settings apply to the account signed in RIGHT NOW: $env:USERNAME"
-    Warn 'If that is not the account the kiosk runs as, stop and sign in as'
-    Warn 'that account first, or the kiosk will not be locked down at all.'
+    Warn "Per-user settings will be written to the hive of: $($hive.Name)"
     Write-Host ''
     if (-not $Unattended) {
-        $go = Read-Host "  Is $env:USERNAME the account the kiosk runs as? (y/n)"
+        $go = Read-Host "  Is $($hive.Name) the account the kiosk runs as? (y/n)"
         if ($go -notmatch '^[yY]') { Die 'Stopped. Sign in as the kiosk account and run this again.' }
     }
 
     Step 'Applying Windows and Edge restrictions'
-    reg import $reg 2>&1 | Out-Null
-    Say 'policies imported'
+    reg import $reg 2>&1 | Out-Null       # machine-wide policy only now
+    Set-UserPolicies -Hive $hive -On $true
+    Say 'policies applied'
 
     # Build the Edge URL allow list from the configured app URL, so the
     # kiosk cannot browse anywhere else and the app still works.
@@ -339,8 +421,10 @@ function Invoke-Lockdown {
         $ahk = Get-AutoHotkey -Dir $Dir
         if (-not $ahk) { Die 'AutoHotkey not found - cannot set the shell' }
         $shell = '"' + $ahk + '" "' + (Join-Path $Dir 'kiosk-lock.ahk') + '"'
-        reg add 'HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' /v Shell /t REG_SZ /d $shell /f | Out-Null
-        Say 'the kiosk is now the Windows shell FOR THIS USER ONLY'
+        # Must be the kiosk account's hive. Writing this into an admin
+        # hive by mistake means the administrator signs in to a kiosk.
+        reg add "$($hive.Reg)\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d $shell /f | Out-Null
+        Say "the kiosk is now the Windows shell for $($hive.Name) ONLY"
         Warn 'Explorer will not start at next sign-in: no taskbar, no Start menu, no Task View'
         Warn 'Alt+F4 brings Explorer back for the rest of that session'
     }
@@ -356,23 +440,31 @@ function Invoke-Lockdown {
 function Invoke-Verify {
     param([string]$Dir)
 
-    Step "Checking lockdown for $env:USERNAME"
+    $hive = Get-KioskHive -UserName $KioskUser
+    Step "Checking lockdown for $($hive.Name)"
     $problems = @()
 
-    if (Get-Process explorer -ErrorAction SilentlyContinue) {
-        $problems += 'Explorer is RUNNING - the shell was not replaced for this user. Taskbar, Start menu and edge swipes all work.'
+    # Session-scoped: an administrator signed in elsewhere used to make
+    # this report a lockdown failure that was not real.
+    $expl = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue |
+            Where-Object {
+                $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
+                "$($o.Domain)\$($o.User)" -eq $hive.Name -or $o.User -eq ($hive.Name -split '\\')[-1]
+            }
+    if ($expl) {
+        $problems += "Explorer is RUNNING for $($hive.Name) - the shell was not replaced. Taskbar, Start menu and edge swipes all work."
     }
 
-    $shell = (Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name Shell -ErrorAction SilentlyContinue).Shell
-    if (-not $shell)                      { $problems += "no kiosk shell set for $env:USERNAME" }
-    elseif ($shell -notmatch 'kiosk-lock'){ $problems += "the shell for $env:USERNAME is something else: $shell" }
+    $shell = (Get-ItemProperty (Join-Path $hive.Path 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon') -Name Shell -ErrorAction SilentlyContinue).Shell
+    if (-not $shell)                      { $problems += "no kiosk shell set for $($hive.Name)" }
+    elseif ($shell -notmatch 'kiosk-lock'){ $problems += "the shell for $($hive.Name) is something else: $shell" }
 
     $checks = @(
         @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\EdgeUI'; Name='AllowEdgeSwipe'; Want=0; What='edge swipe from the screen sides' },
-        @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System'; Name='DisableTaskMgr'; Want=1; What='Task Manager' },
-        @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name='NoWinKeys'; Want=1; What='Windows key shortcuts' },
-        @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System'; Name='DisableLockWorkstation'; Want=1; What='Win+L lock' },
-        @{ Path='HKCU:\Software\Microsoft\Wisp\Touch'; Name='TouchMode_hold'; Want=0; What='press-and-hold right click' }
+        @{ Path=(Join-Path $hive.Path 'Software\Microsoft\Windows\CurrentVersion\Policies\System');   Name='DisableTaskMgr';         Want=1; What='Task Manager' },
+        @{ Path=(Join-Path $hive.Path 'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'); Name='NoWinKeys';              Want=1; What='Windows key shortcuts' },
+        @{ Path=(Join-Path $hive.Path 'Software\Microsoft\Windows\CurrentVersion\Policies\System');   Name='DisableLockWorkstation'; Want=1; What='Win+L lock' },
+        @{ Path=(Join-Path $hive.Path 'Software\Microsoft\Wisp\Touch');                               Name='TouchMode_hold';         Want=0; What='press-and-hold right click' }
     )
     foreach ($c in $checks) {
         $v = (Get-ItemProperty $c.Path -Name $c.Name -ErrorAction SilentlyContinue).$($c.Name)
@@ -404,9 +496,12 @@ function Invoke-Unlock {
     param([string]$Dir)
     $reg = Join-Path $Dir 'kiosk-unlock.reg'
     if (-not (Test-Path $reg)) { Die "kiosk-unlock.reg not found in $Dir" }
+    $hive = Get-KioskHive -UserName $KioskUser
+
     Step 'Removing the restrictions'
     reg import $reg 2>&1 | Out-Null
-    reg delete 'HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' /v Shell /f 2>&1 | Out-Null
+    Set-UserPolicies -Hive $hive -On $false
+    reg delete "$($hive.Reg)\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /f 2>&1 | Out-Null
     reg delete 'HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization' /v NoLockScreen /f 2>&1 | Out-Null
     Say 'Explorer will start normally at the next sign-in'
     Say 'sign out and back in, or reboot, to finish'
