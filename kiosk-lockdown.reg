@@ -53,3 +53,19 @@ Windows Registry Editor Version 5.00
 "4"="[*.]arcgis.net"
 "5"="[*.]vimeo.com"
 "6"="[*.]vimeocdn.com"
+
+; ---------------------------------------------------------------------
+;  Stop Edge updating itself during opening hours. The command-line
+;  --check-for-update-interval does NOT affect the EdgeUpdate service.
+;  0 = updates disabled. Use 3 (manual only) if you would rather patch
+;  by hand; either way it must not happen unattended mid-event.
+; ---------------------------------------------------------------------
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\EdgeUpdate]
+"UpdateDefault"=dword:00000000
+"AutoUpdateCheckPeriodMinutes"=dword:00000000
+"InstallDefault"=dword:00000000
+
+; Cap the browser cache so a profile that lives for months cannot fill
+; the disk. 262144000 = 250 MB.
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge]
+"DiskCacheSize"=dword:0fa00000
