@@ -284,7 +284,10 @@ function Add-Shortcuts {
 #  Power
 # ---------------------------------------------------------------------
 function Set-Power {
-    foreach ($a in @('monitor-timeout-ac 0','standby-timeout-ac 0','disk-timeout-ac 0','hibernate-timeout-ac 0')) {
+        foreach ($a in @('monitor-timeout-ac 0','monitor-timeout-dc 0',
+                     'standby-timeout-ac 0','standby-timeout-dc 0',
+                     'disk-timeout-ac 0','disk-timeout-dc 0',
+                     'hibernate-timeout-ac 0','hibernate-timeout-dc 0')) {
         Start-Process powercfg -ArgumentList "/change $a" -Wait -WindowStyle Hidden
     }
     reg add 'HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization' /v NoLockScreen /t REG_DWORD /d 1 /f | Out-Null
