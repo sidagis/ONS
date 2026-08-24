@@ -237,10 +237,30 @@ if ($Mode -eq "Lock") {
     Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\EdgeUI" "TurnOffBackstack" 1
     Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
     Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
+    Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" "AutoRestartShell" 0
+    Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "HideFastUserSwitching" 1
 
     # notifications
     Set-Reg "$UH\SOFTWARE\Policies\Microsoft\Windows\Explorer" "DisableNotificationCenter" 1
     Set-Reg "$UH\Software\Microsoft\Windows\CurrentVersion\PushNotifications" "ToastEnabled" 0
+
+    # --- shell restrictions ------------------------------------------
+    # Explorer keeps running in this design, so the taskbar and Start menu
+    # are only hidden, not absent. These stop them being reachable.
+    $pex = "$UH\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+    foreach ($n in "NoWinKeys","NoRun","NoClose","NoLogoff","NoControlPanel",
+                   "NoSetTaskbar","NoTrayContextMenu","NoViewContextMenu") {
+        Set-Reg $pex $n 1
+    }
+    $psy = "$UH\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+    foreach ($n in "DisableTaskMgr","DisableLockWorkstation","DisableChangePassword") {
+        Set-Reg $psy $n 1
+    }
+
+    # Press-and-hold = right click, at source, so no ripple circle appears
+    # under a visitor's finger either.
+    Set-Reg "$UH\Software\Microsoft\Wisp\Touch" "TouchMode_hold" 0
+    
 
     # taskbar
     $adv = "$UH\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
@@ -306,8 +326,13 @@ if ($Mode -eq "Unlock") {
     Del-Val "HKLM:\SOFTWARE\Policies\Microsoft\Windows\EdgeUI" "TurnOffBackstack"
     Del-Val "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests"
     Del-Val "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot"
+        Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" "AutoRestartShell" 1
+    Del-Val "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "HideFastUserSwitching"
 
     Del-Val "$UH\SOFTWARE\Policies\Microsoft\Windows\Explorer" "DisableNotificationCenter"
+    Del-Key "$UH\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+    Del-Key "$UH\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+    Set-Reg "$UH\Software\Microsoft\Wisp\Touch" "TouchMode_hold" 1
     Set-Reg "$UH\Software\Microsoft\Windows\CurrentVersion\PushNotifications" "ToastEnabled" 1
 
     $adv = "$UH\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
@@ -523,6 +548,16 @@ Sub KillOurEdge()
     On Error GoTo 0
 End Sub
 
+Sub KillExplorer()
+    Dim procs, p
+    On Error Resume Next
+    Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='explorer.exe'")
+    For Each p In procs
+        sh.Run "taskkill /F /PID " & p.ProcessId, 0, True
+    Next
+    On Error GoTo 0
+End Sub
+
 Set wmi = GetObject("winmgmts:\\.\root\cimv2")
 
 ' ---- 1. lock Windows down ------------------------------------------
@@ -543,7 +578,11 @@ Do While Not fso.FileExists(DIR & "\lock.done")
         Exit Do
     End If
 Loop
-WScript.Sleep 1500   ' let the new Explorer settle
+Log "stopping Explorer for this session"
+KillExplorer
+WScript.Sleep 800
+KillExplorer
+WScript.Sleep 700
 
 ' ---- 2. live or mirror ---------------------------------------------
 url = MAP_URL
@@ -715,6 +754,15 @@ KillOurEdge
 
 Log "requesting unlock"
 sh.Run "schtasks /run /tn """ & TASK_UNLK & """", 0, True
+
+' Wait for the policies to be back, then bring the shell up in THIS
+' session - the SYSTEM task cannot, it lives in session 0.
+Dim uw : uw = 0
+Do While Not fso.FileExists(DIR & "\unlock.done") And uw < 20000
+    WScript.Sleep 500
+    uw = uw + 500
+Loop
+sh.Run "explorer.exe", 1, False
 
 Set wmi = Nothing
 Set sh  = Nothing
