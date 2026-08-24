@@ -40,7 +40,7 @@ param(
     [switch]$Local,
 
     # Never prompt; accept defaults.
-    [switch]$Unattended
+    [switch]$Unattended,
 
     [string]$KioskUser
 )
