@@ -104,6 +104,11 @@ SetTimer MotionTick, CFG["MotionSampleMs"]
 
 BuildTrayMenu()
 LogLockdownCheck()
+
+; Registered here, in the auto-execute section. At the bottom of the file
+; it sits after the return above and never runs, which would leave the
+; machine locked down with no shell if the script died untidily.
+OnExit(KioskOnExit)
 return
 
 ; =====================================================================
@@ -1364,7 +1369,6 @@ ExitKiosk() {
 
 ; A script error, a shutdown, or Exit from the tray must not leave the
 ; machine locked down with no shell. UnlockSession() is idempotent.
-OnExit(KioskOnExit)
 KioskOnExit(reason, code) {
     global exiting, CFG
     if (!exiting && CFG["SessionLockdown"]) {
