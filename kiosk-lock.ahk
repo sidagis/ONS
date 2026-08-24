@@ -30,6 +30,7 @@ CoordMode "Mouse", "Screen"
 
 global INI := A_ScriptDir "\kiosk.ini"
 global LOGFILE := A_ScriptDir "\kiosk-log.txt"
+Tick() => DllCall("kernel32\GetTickCount64", "uint64")
 global CFG := LoadConfig()
 global exiting := false
 
@@ -40,12 +41,13 @@ global lastResetAt := 0
 global prewarmPending := 0         ; when a post-reset standby build is due
 global resetsSinceRestart := 0     ; swaps done since Edge was last restarted
 global restarting := false
+global lastRestartAt := 0
 global lastNightly := ""           ; date of the last scheduled restart
 
 ; The kiosk injects mouse clicks and keystrokes of its own, and Windows
 ; counts those as user input. So idle time is tracked here rather than
 ; read straight from A_TimeIdle - see UpdateIdle().
-global lastRealInput := A_TickCount
+global lastRealInput := Tick()
 global injectTime := 0             ; moment of our last injected click or keystroke
 global warmSent := false
 global inputSinceReset := false    ; has a visitor touched it since the last reset
@@ -84,7 +86,7 @@ StartEdge()
 
 if (CFG["FastReset"] && USES_WRAPPER && CFG["PrewarmAfterReset"]) {
     warmSent := true
-    prewarmPending := A_TickCount + 45000     ; after the first load has settled
+    prewarmPending := Tick() + 45000     ; after the first load has settled
 }
 
 if (CFG["BlockAllKeys"])
@@ -138,6 +140,7 @@ LoadConfig() {
     c["RestartEveryResets"]  := NumOr(IniRead(INI, "Kiosk", "RestartEveryResets", 25), 25)
     c["MaxEdgeMemoryMB"]     := NumOr(IniRead(INI, "Kiosk", "MaxEdgeMemoryMB", 2500), 2500)
     c["NightlyRestart"]      := Trim(IniRead(INI, "Kiosk", "NightlyRestart", "03:30"))
+    c["RestartMinIntervalMinutes"] := NumOr(IniRead(INI, "Kiosk", "RestartMinIntervalMinutes", 20), 20)
 
     if (c["IdleSeconds"] < 5)                          ; a typo must not brick the kiosk
         c["IdleSeconds"] := 5
@@ -226,15 +229,19 @@ JsEsc(s) => StrReplace(StrReplace(s, "\", "\\"), '"', '\"')
 
 BuildEdgeArgs() {
     global CFG, START_URL
-    ; Hardware video overlays can put video frames on a separate plane
-    ; that never reaches the composited desktop image - so a screen
-    ; sample of a playing video reads as a static black rectangle and the
-    ; motion detector sees nothing. Turning overlays off costs a little
-    ; video efficiency and makes the pixels readable.
-    overlay := CFG["DisableVideoOverlay"]
-        ? ' --disable-direct-composition-video-overlays'
-        . ' --disable-features=DirectCompositionVideoSwapChain,UseMultiPlaneFormatForHardwareVideo'
-        : ''
+
+    ; ONE --disable-features switch only. Chromium stores switches in a
+    ; map, so a second --disable-features= silently discards the first.
+    ; This used to throw away the video-overlay flags below, which are
+    ; what make a playing video readable to the VideoRect detector.
+    feats := "TranslateUI,EdgeShoppingAssistant,msEdgeSidebar,EdgeSplitScreen,msWebOOUI"
+
+    overlay := ""
+    if (CFG["DisableVideoOverlay"]) {
+        overlay := ' --disable-direct-composition-video-overlays'
+        feats .= ",DirectCompositionVideoSwapChain,UseMultiPlaneFormatForHardwareVideo"
+    }
+
     return '--kiosk "' START_URL '"' overlay
         . ' --edge-kiosk-type=fullscreen'
         . ' --kiosk-idle-timeout-minutes=0'
@@ -242,11 +249,12 @@ BuildEdgeArgs() {
         . ' --no-first-run --no-default-browser-check --disable-sync'
         . ' --noerrdialogs --disable-session-crashed-bubble --hide-crash-restore-bubble'
         . ' --disable-infobars --disable-popup-blocking'
-        . ' --disable-features=TranslateUI,EdgeShoppingAssistant,msEdgeSidebar,EdgeSplitScreen,msWebOOUI'
+        . ' --disable-features=' feats
         . ' --disable-pinch --overscroll-history-navigation=0'
         . ' --disable-backgrounding-occluded-windows'
         . ' --disable-background-timer-throttling --disable-renderer-backgrounding'
         . ' --autoplay-policy=no-user-gesture-required'
+        . ' --disable-background-networking --disable-component-update'
         . ' --check-for-update-interval=31536000'
         . ' --start-fullscreen'
 }
@@ -269,7 +277,7 @@ BuildEdgeArgs() {
 ; matching it is discarded, however long ago it was.
 UpdateIdle() {
     global lastRealInput, injectTime, inputSinceReset, houseKept
-    t := A_TickCount - A_TimeIdle
+    t := Tick() - A_TimeIdle
 
     if (t <= lastRealInput)
         return
@@ -285,12 +293,12 @@ UpdateIdle() {
 ; matches the last synthetic event Windows saw.
 Injecting() {
     global injectTime
-    injectTime := A_TickCount
+    injectTime := Tick()
 }
 
 IdleMs() {
     global lastRealInput
-    return A_TickCount - lastRealInput
+    return Tick() - lastRealInput
 }
 
 ; =====================================================================
@@ -310,7 +318,7 @@ IdleWatch() {
     ; detector needs two consecutive samples before it can say anything.
     why := DetectVideo()
     if (why != "") {
-        mediaLastSeen := A_TickCount
+        mediaLastSeen := Tick()
         mediaWhy := why
     }
 
@@ -318,7 +326,7 @@ IdleWatch() {
 
     ; A build queued for just after a reset: the kiosk is unattended and
     ; nothing is playing, which is the safest possible moment for it.
-    if (prewarmPending && A_TickCount >= prewarmPending && why = "") {
+    if (prewarmPending && Tick() >= prewarmPending && why = "") {
         prewarmPending := 0
         LogLine("standby build requested (after reset)")
         TapZone("warm", false)
@@ -357,7 +365,7 @@ IdleWatch() {
             houseKept := true
             LogLine("housekeeping reload after " CFG["IdleReloadMinutes"] " idle minutes")
             HardReload()
-            lastRealInput := A_TickCount
+            lastRealInput := Tick()
         }
         return
     }
@@ -365,7 +373,7 @@ IdleWatch() {
     ; Idle threshold passed. Hold the reset back if a video was seen
     ; recently, unless we have been holding past the ceiling.
     if (mediaLastSeen
-        && (A_TickCount - mediaLastSeen) < CFG["PostVideoSeconds"] * 1000
+        && (Tick() - mediaLastSeen) < CFG["PostVideoSeconds"] * 1000
         && idle < CFG["MaxHoldSeconds"] * 1000)
         return
 
@@ -374,22 +382,29 @@ IdleWatch() {
         resetsSinceRestart++
         LogLine("RESET #" resetsSinceRestart " at idle " Round(idle / 1000) "s"
               . " - Edge using " EdgeMemoryMB() " MB"
-              . " - video last detected " (mediaLastSeen ? Round((A_TickCount - mediaLastSeen) / 1000) "s ago (" mediaWhy ")" : "never")
+              . " - video last detected " (mediaLastSeen ? Round((Tick() - mediaLastSeen) / 1000) "s ago (" mediaWhy ")" : "never")
               . " - motion " motionPct "% - audio " (CFG["HoldForAudio"] ? (EdgeAudioActive() ? "playing" : "quiet") : "off"))
         mediaLastSeen := 0
         mediaWhy := ""
-        if (RestartDue())
-            RestartEdge()
-        else
-            ResetApp()
 
-        lastResetAt := A_TickCount
-        lastRealInput := A_TickCount     ; the idle clock restarts now
+        restarted := false
+        if (RestartDue()) {
+            RestartEdge()
+            restarted := true
+        } else {
+            ResetApp()
+        }
+
+        lastResetAt := Tick()
+        lastRealInput := Tick()     ; the idle clock restarts now
         inputSinceReset := false
 
-        if (CFG["FastReset"] && USES_WRAPPER && CFG["PrewarmAfterReset"]) {
-            warmSent := true                        ; the idle-based build must not also fire
-            prewarmPending := A_TickCount + 3000    ; let the swap settle first
+        if (restarted) {
+            ; RestartEdge() has already queued its own build for +45s, which
+            ; is how long a cold Edge needs. Do not stamp on it with +3s.
+        } else if (CFG["FastReset"] && USES_WRAPPER && CFG["PrewarmAfterReset"]) {
+            warmSent := true                   ; the idle-based build must not also fire
+            prewarmPending := Tick() + 3000    ; let the swap settle first
         } else {
             warmSent := false
         }
@@ -507,7 +522,7 @@ MotionTick() {
     ; Only sample when a decision is close, with enough lead time to fill
     ; the window first - unless the tuning meter is running.
     lead := CFG["MotionWindowMs"] + 3000
-    if (A_TickCount > meterUntil && IdleMs() < CFG["IdleSeconds"] * 1000 - lead) {
+    if (Tick() > meterUntil && IdleMs() < CFG["IdleSeconds"] * 1000 - lead) {
         if (motionHist.Length) {
             motionHist := []
             motionPrev := ""
@@ -658,8 +673,8 @@ ResetApp() {
 ; document.title into the window text, and a posted click is not always
 ; honoured. Any change in either means the click landed.
 WaitForAck(tokBefore, pixBefore, timeoutMs) {
-    t0 := A_TickCount
-    while (A_TickCount - t0 < timeoutMs) {
+    t0 := Tick()
+    while (Tick() - t0 < timeoutMs) {
         Sleep 40
         t := ResetToken()
         if (t != "" && t != tokBefore)
@@ -775,17 +790,50 @@ TapZone(which, realClick := true) {
 ; reset used to clear that out dozens of times a day as a side effect.
 ; These restarts put that hygiene back, at moments when nobody is there.
 
-EdgeMemoryMB() {
+; Private working set, not total working set: summing WorkingSetSize over
+; ten Chromium processes counts every shared page ten times, so the old
+; figure was roughly double the truth and MaxEdgeMemoryMB fired early.
+; Cached, because this used to run two or three times per reset and each
+; WMI round trip stalls the reset path.
+EdgeMemoryMB(maxAgeMs := 5000) {
+    static cachedMB := 0, cachedAt := 0
+
+    if (cachedAt && Tick() - cachedAt < maxAgeMs)
+        return cachedMB
+
     total := 0
+    got := false
     try {
-        for proc in ComObjGet("winmgmts:\\.\root\cimv2").ExecQuery("SELECT WorkingSetSize FROM Win32_Process WHERE Name='msedge.exe'")
-            total += proc.WorkingSetSize
+        for proc in ComObjGet("winmgmts:\\.\root\cimv2").ExecQuery(
+            "SELECT WorkingSetPrivate FROM Win32_PerfRawData_PerfProc_Process WHERE Name LIKE 'msedge%'") {
+            total += proc.WorkingSetPrivate
+            got := true
+        }
     }
-    return Round(total / 1048576)
+
+    ; The perf class is not always available. Fall back to the old
+    ; measure rather than reporting zero and never restarting.
+    if (!got) {
+        try {
+            for proc in ComObjGet("winmgmts:\\.\root\cimv2").ExecQuery(
+                "SELECT WorkingSetSize FROM Win32_Process WHERE Name='msedge.exe'")
+                total += proc.WorkingSetSize
+        }
+    }
+
+    cachedMB := Round(total / 1048576)
+    cachedAt := Tick()
+    return cachedMB
 }
 
 RestartDue() {
-    global CFG, resetsSinceRestart
+    global CFG, resetsSinceRestart, lastRestartAt
+
+    ; Without a cooldown, a kiosk sitting above the memory threshold turns
+    ; EVERY reset into a full restart plus a loading screen.
+    if (lastRestartAt && Tick() - lastRestartAt < CFG["RestartMinIntervalMinutes"] * 60000)
+        return false
+
     if (CFG["RestartEveryResets"] > 0 && resetsSinceRestart >= CFG["RestartEveryResets"])
         return true
     if (CFG["MaxEdgeMemoryMB"] > 0 && EdgeMemoryMB() > CFG["MaxEdgeMemoryMB"])
@@ -799,21 +847,30 @@ RestartEdge() {
     global CFG, resetsSinceRestart, restarting, warmSent, prewarmPending, lastResetHow, USES_WRAPPER
 
     restarting := true
-    LogLine("restarting Edge - " resetsSinceRestart " resets, " EdgeMemoryMB() " MB in use")
+    LogLine("restarting Edge - " resetsSinceRestart " resets, " EdgeMemoryMB(0) " MB in use")
 
-    try ProcessClose "msedge.exe"
-    Sleep 1500
-    try ProcessClose "msedge.exe"
+    ; ProcessClose closes only the FIRST match. Edge is ten processes, so
+    ; that left most of it running and the relaunch then collided with the
+    ; old instance over --user-data-dir and came up blank.
+    try RunWait A_ComSpec ' /c taskkill /f /im msedge.exe', , "Hide"
+
+    t0 := Tick()
+    while (ProcessExist("msedge.exe") && Tick() - t0 < 10000)
+        Sleep 250
+    if ProcessExist("msedge.exe")
+        LogLine("WARNING: Edge processes still present 10s after taskkill")
     Sleep 500
+
     StartEdge()
 
+    lastRestartAt := Tick()
     resetsSinceRestart := 0
     lastResetHow := "Edge restart"
     warmSent := false
     prewarmPending := 0
     if (CFG["FastReset"] && USES_WRAPPER && CFG["PrewarmAfterReset"]) {
         warmSent := true
-        prewarmPending := A_TickCount + 45000
+        prewarmPending := Tick() + 45000
     }
     restarting := false
 }
@@ -884,7 +941,25 @@ NoSleepTick() {
     ; ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
     try DllCall("kernel32\\SetThreadExecutionState", "uint", 0x80000003 | 0x2)
 }
-
+; ProcessExist("explorer.exe") is machine-wide. An administrator signed in
+; on a second session made this report a lockdown failure that was not real.
+ExplorerInThisSession() {
+    static mySid := -1
+    if (mySid = -1) {
+        sid := 0
+        DllCall("kernel32\ProcessIdToSessionId"
+              , "uint", DllCall("kernel32\GetCurrentProcessId", "uint")
+              , "uint*", &sid)
+        mySid := sid
+    }
+    try {
+        for p in ComObjGet("winmgmts:\\.\root\cimv2").ExecQuery(
+            "SELECT SessionId FROM Win32_Process WHERE Name='explorer.exe'")
+            if (p.SessionId = mySid)
+                return true
+    }
+    return false
+}
 ; =====================================================================
 ;  Lockdown self-check
 ; =====================================================================
@@ -894,7 +969,7 @@ NoSleepTick() {
 LockdownIssues() {
     issues := []
 
-    if ProcessExist("explorer.exe")
+    if ExplorerInThisSession()
         issues.Push("Explorer is RUNNING - the shell was not replaced for this user, so the taskbar, Start menu and edge swipes all work")
 
     shell := ""
@@ -957,7 +1032,15 @@ ShowLockdownCheck() {
 
 LogLine(text) {
     global LOGFILE
-    try FileAppend FormatTime(, "yyyy-MM-dd HH:mm:ss") "  " text "`n", LOGFILE, "UTF-8-RAW"
+    try {
+        ; One line per reset over months is a large file on a machine
+        ; nobody visits. Keep the current log and one previous.
+        if (FileExist(LOGFILE) && FileGetSize(LOGFILE) > 2097152) {
+            try FileDelete LOGFILE ".1"
+            try FileMove LOGFILE, LOGFILE ".1"
+        }
+        FileAppend FormatTime(, "yyyy-MM-dd HH:mm:ss") "  " text "`n", LOGFILE, "UTF-8-RAW"
+    }
 }
 
 ; =====================================================================
@@ -989,7 +1072,7 @@ BuildTrayMenu() {
 ShowStatus() {
     global CFG, mediaLastSeen, mediaWhy, lastResetHow, USES_WRAPPER, inputSinceReset, warmSent, lastResetAt, prewarmPending, resetsSinceRestart
     live := DetectVideo()
-    ago := mediaLastSeen ? Round((A_TickCount - mediaLastSeen) / 1000) " s ago" : "never"
+    ago := mediaLastSeen ? Round((Tick() - mediaLastSeen) / 1000) " s ago" : "never"
     tok := ResetToken()
     MsgBox ""
         . "VIDEO`n"
@@ -1012,7 +1095,7 @@ ShowStatus() {
         . "  ack pixel:      " (AckPixel() != "" ? AckPixel() " (this is what confirms a swap)" : "unreadable") "`n"
         . "  wrapper token:  " (tok != "" ? tok : "not visible (harmless, the pixel is the real channel)") "`n"
         . "  last reset via: " lastResetHow
-        . "`n  last reset:     " (lastResetAt ? Round((A_TickCount - lastResetAt) / 1000) " s ago" : "not yet this session")
+        . "`n  last reset:     " (lastResetAt ? Round((Tick() - lastResetAt) / 1000) " s ago" : "not yet this session")
         . "`n  resets so far:  " resetsSinceRestart " since Edge last restarted (restart at " CFG["RestartEveryResets"] ")"
         . "`n  Edge memory:    " EdgeMemoryMB() " MB (restart above " CFG["MaxEdgeMemoryMB"] " MB)"
         . "`n`nEvery reset is logged with the reason to kiosk-log.txt."
@@ -1057,19 +1140,19 @@ MotionMeter() {
         return
     }
 
-    meterUntil := A_TickCount + 30000
+    meterUntil := Tick() + 30000
     motionHist := []
     SetTimer MeterTick, 250
 }
 
 MeterTick() {
     global CFG, motionPct, motionPlaying, meterUntil
-    if (A_TickCount > meterUntil) {
+    if (Tick() > meterUntil) {
         SetTimer MeterTick, 0
         ToolTip
         return
     }
-    left := Round((meterUntil - A_TickCount) / 1000)
+    left := Round((meterUntil - Tick()) / 1000)
     ToolTip "Motion in " CFG["VideoRect"] "`n`n"
           . motionPct "% sustained`n"
           . "verdict: " (motionPlaying ? "PLAYING - reset held" : "not a video - reset allowed") "`n"
@@ -1167,7 +1250,7 @@ ExitKiosk() {
     Sleep 400
     try ProcessClose "msedge.exe"     ; second pass for stragglers
 
-    if (CFG["ExitToDesktop"] && !ProcessExist("explorer.exe"))
+    if (CFG["ExitToDesktop"] && !ExplorerInThisSession())
         try Run "explorer.exe"
 
     ExitApp
