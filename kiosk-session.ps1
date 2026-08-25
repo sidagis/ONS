@@ -109,11 +109,16 @@ if ($Mode -eq "Lock") {
 
     $allow = @(
         "file:///" + $Dir.Replace('\','/').TrimEnd('/') + "/"
-        "[*.]arcgis.com"
-        "[*.]arcgisonline.com"
-        "[*.]arcgis.net"
-        "[*.]vimeo.com"
-        "[*.]vimeocdn.com"
+        "arcgis.com"
+        "arcgisonline.com"
+        "arcgis.net"
+        "vimeo.com"
+        "vimeocdn.com"
+        "sodir.no"              # FactMaps services
+        "sidagis.github.io"     # the map kiosk page, if this stand shows it
+        "githubusercontent.com"
+        "fonts.googleapis.com"  # Open Sans; without these the type falls back
+        "fonts.gstatic.com"
     )
     # Whatever host AppUrl actually points at, plus its parent domain.
     $url = Get-IniValue "AppUrl"
@@ -121,7 +126,7 @@ if ($Mode -eq "Lock") {
         $h = $Matches[1]
         $allow += $h
         $parts = $h.Split('.')
-        if ($parts.Count -ge 2) { $allow += ('[*.]' + ($parts[-2..-1] -join '.')) }
+        if ($parts.Count -ge 2) { $allow += ($parts[-2..-1] -join '.') }
     }
     $allow = $allow | Select-Object -Unique
 
