@@ -956,7 +956,7 @@ KeepAwake() {
 
 NoSleepTick() {
     ; ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
-    try DllCall("kernel32\\SetThreadExecutionState", "uint", 0x80000003 | 0x2)
+    try DllCall("kernel32\SetThreadExecutionState", "uint", 0x80000003 | 0x2)
 }
 
 ; =====================================================================
