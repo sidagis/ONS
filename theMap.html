@@ -8,6 +8,54 @@
 
   <!-- ArcGIS Maps SDK for JavaScript 4.32 (last 4.x, stable). CDN load. -->
   <link rel="stylesheet" href="https://js.arcgis.com/4.32/esri/themes/light/main.css" />
+  <script>
+   /* =====================================================================
+       BOOT WATCHDOG - must stay ABOVE the ArcGIS loader.
+
+       A stand that powers up faster than its network - the normal case after
+       a power cut - used to sit half-loaded for the rest of the day: the
+       idle timer was never armed, nothing reset, and this kiosk has no
+       controller or watchdog behind it to restart Edge.
+
+       Any failure to reach a working map now ends in a reload, backing off
+       so a genuinely broken build does not hammer GitHub and ArcGIS all
+       night. The timer below is the one that catches the case no in-page
+       handler can: the ArcGIS bundle itself never arriving, so the require
+       callback never runs at all.
+       =====================================================================*/
+    window.KIOSK_BOOT = (function () {
+      var KEY = "kioskBootFails";
+      var FIRST_LOAD_TIMEOUT_MS = 60000;
+
+      var api = {
+        ready: false,
+        reloading: false,
+
+        ok: function () {
+          api.ready = true;
+          try { sessionStorage.removeItem(KEY); } catch (e) { }
+        },
+
+        fail: function (why, err) {
+          if (api.ready || api.reloading) return;
+          api.reloading = true;
+          var n = 1;
+          try {
+            n = (parseInt(sessionStorage.getItem(KEY), 10) || 0) + 1;
+            sessionStorage.setItem(KEY, String(n));
+          } catch (e) { }
+          var wait = Math.min(300000, 15000 * n);
+          console.error("kiosk boot failed (" + why + ", attempt " + n +
+                        ") - reloading in " + Math.round(wait / 1000) + "s:", err);
+          setTimeout(function () { location.reload(); }, wait);
+        }
+      };
+
+      setTimeout(function () { api.fail("timed out waiting for the app", null); },
+                 FIRST_LOAD_TIMEOUT_MS);
+      return api;
+    })();
+  </script>
   <script src="https://js.arcgis.com/4.32/"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -5821,7 +5869,8 @@ window.addEventListener("contextmenu", function (e) {
 
 
 
-        locateLayers().then(function () {
+       return locateLayers().then(function () {
+          if (!factMapsLayer) throw new Error("FactMaps layer not found after load");
                   // Turn off the MapImageLayer's per-ring labels for 502.
           const lbl502 = getSublayer(502);
           if (lbl502) lbl502.labelsVisible = false;
@@ -5850,18 +5899,20 @@ window.addEventListener("contextmenu", function (e) {
           view.map.add(labelLayer);
           snapshotDefaults();
 
-          goToExtent(CONFIG.extents.home, false).finally(function () {
+          return goToExtent(CONFIG.extents.home, false).finally(function () {
             setTimeout(showAttract, 1500);
             initialViewpoint = view.viewpoint.clone();
             const homeScale = view.scale;
             view.constraints.minScale = homeScale * 2;
             view.constraints.maxScale = 0;
             armIdleTimer();
+
+            KIOSK_BOOT.ok();
             
           });
         });
       }).catch(function (err) {
-        console.error("View failed to load:", err);
+        KIOSK_BOOT.fail("view or layers", err);
       });
       
       document.getElementById("titleOverlay").addEventListener("click", function () {
@@ -5869,6 +5920,7 @@ window.addEventListener("contextmenu", function (e) {
   resetToDefaults();
   view.goTo(initialViewpoint || CONFIG.extents.home, { animate: false }).catch(function () {});
   interacted = true;
+  lastInteractionAt = Date.now();
   armIdleTimer();
 });
 
@@ -6213,6 +6265,7 @@ window.addEventListener("contextmenu", function (e) {
           Promise.resolve(actions[key]()).finally(function () {
             actionRunning = false;
             interacted = true;
+            lastInteractionAt = Date.now();
             armIdleTimer();
           });
         });
@@ -6258,7 +6311,7 @@ function hideAttract() {
       // stand re-runs resetToDefaults() and an animated goTo every 25
       // seconds all night, thousands of times, for nobody.
       let interacted = false;
-      let lastLoadAt = Date.now();
+      let lastInteractionAt = Date.now();
       const RELOAD_AFTER_IDLE_MS = 30 * 60 * 1000;
 
       function armIdleTimer() {
@@ -6277,10 +6330,8 @@ function hideAttract() {
           } else {
             goToExtent(CONFIG.extents.home);
           }
-        } else if (Date.now() - lastLoadAt > RELOAD_AFTER_IDLE_MS) {
-          // Nobody has touched it since the last reset and this document
-          // has been alive a long time. One full reload as housekeeping -
-          // it can only ever happen with the stand unattended.
+        } else if (Date.now() - lastInteractionAt > RELOAD_AFTER_IDLE_MS) {
+
           location.reload();
           return;
         }
@@ -6295,6 +6346,7 @@ function hideAttract() {
 
       function noteInteraction() {
         interacted = true;
+        lastInteractionAt = Date.now();
         armIdleTimer();
         hideAttract();
       }
