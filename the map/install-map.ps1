@@ -151,16 +151,66 @@ $DoneUnlk = Join-Path $Dir "unlock.done"
 
 function Log { param($m) "$(Get-Date -f 'yyyy-MM-dd HH:mm:ss')  [lock] $m" | Add-Content $LogFile }
 
-# --- the signed-in user's registry hive (SYSTEM's own HKCU is useless) ---
-function Get-UserHive {
-    $p = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
-    if ($p) {
-        $sid = (Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid).Sid
-        if ($sid -and (Test-Path "Registry::HKEY_USERS\$sid")) { return "Registry::HKEY_USERS\$sid" }
-    }
-    return "Registry::HKEY_CURRENT_USER"
+# --- the signed-in user's registry hive -------------------------------
+# SYSTEM's own HKCU is useless here, and resolving the hive from the owner
+# of explorer.exe only works at LOCK time. By the time Unlock runs,
+# start-map.vbs has already killed the session's Explorer, so the lookup
+# found nothing, fell back to SYSTEM's hive, and reverted the policies
+# there. The kiosk account kept NoWinKeys, NoRun, DisableTaskMgr, the
+# auto-hidden taskbar and the rest permanently, from the first session on.
+#
+#   1. the SID recorded when Lock ran   - authoritative, needs no Explorer
+#   2. Win32_ComputerSystem.UserName    - the console user, also survives it
+#   3. the owner of explorer.exe        - last resort
+$SidFile = Join-Path $Dir "hive.sid"
+
+function Resolve-Sid {
+    param([string]$Name)
+    try {
+        return (New-Object Security.Principal.NTAccount($Name)).Translate(
+                   [Security.Principal.SecurityIdentifier]).Value
+    } catch { return $null }
 }
-$UH = Get-UserHive
+
+function Remember-Sid {
+    param([string]$Sid)
+    if ($Mode -eq "Lock" -and $Sid) { Set-Content -Path $SidFile -Value $Sid -Encoding ASCII }
+}
+
+ function Get-UserHive {
+    if ($Mode -eq "Unlock" -and (Test-Path $SidFile)) {
+        $sid = (Get-Content $SidFile -Raw).Trim()
+        if ($sid -and (Test-Path "Registry::HKEY_USERS\$sid")) {
+            Log "user hive from hive.sid: $sid"
+            return "Registry::HKEY_USERS\$sid"
+        }
+        Log "hive.sid names a hive that is no longer loaded - falling through"
+    }
+
+    $name = (Get-CimInstance Win32_ComputerSystem).UserName
+    if ($name) {
+        $sid = Resolve-Sid $name
+        if ($sid -and (Test-Path "Registry::HKEY_USERS\$sid")) {
+            Log "user hive: $name"
+            Remember-Sid $sid
+            return "Registry::HKEY_USERS\$sid"
+        }
+    }
+
+     $p = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
+     if ($p) {
+         $sid = (Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid).Sid
+        if ($sid -and (Test-Path "Registry::HKEY_USERS\$sid")) {
+            Log "user hive resolved via Explorer: $sid"
+            Remember-Sid $sid
+            return "Registry::HKEY_USERS\$sid"
+        }
+     }
+
+    Log "WARNING: could not resolve the interactive user - falling back to SYSTEM's own hive"
+     return "Registry::HKEY_CURRENT_USER"
+ }
+ $UH = Get-UserHive
 
 function Set-Reg {
     param($Path,$Name,$Value,[string]$Type="DWord")
@@ -179,23 +229,6 @@ function Set-TaskbarAutoHide {
     Set-ItemProperty -Path $sr -Name Settings -Value $b -Force
 }
 
-# Explorer must be recycled for gesture and taskbar policy to take hold.
-# Windows relaunches it by itself; this is the one-frame black flash.
-function Restart-Explorer {
-    Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force
-
-    # AutoRestartShell normally brings it back, but a forced kill does not
-    # always trigger it and the result is a wallpaper with no shell at all.
-    $waited = 0
-    while ($waited -lt 8) {
-        Start-Sleep -Seconds 1
-        $waited++
-        if (Get-Process explorer -ErrorAction SilentlyContinue) { return }
-    }
-    Log "Explorer did not come back on its own - starting it"
-    Start-Process "$env:SystemRoot\explorer.exe"
-    Start-Sleep -Seconds 2
-}
 
 # =============================== LOCK ================================
 if ($Mode -eq "Lock") {
@@ -205,10 +238,13 @@ if ($Mode -eq "Lock") {
     $E = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
     $allow = @(
         "sidagis.github.io"
-        "*.githubusercontent.com"
-        "*.arcgis.com"
-        "*.arcgisonline.com"
-        "*.sodir.no"
+        "githubusercontent.com"
+        "arcgis.com"
+        "arcgisonline.com"
+        "arcgis.net"
+        "sodir.no"
+        "fonts.googleapis.com"   # Open Sans - without these the type falls back
+        "fonts.gstatic.com"
         "127.0.0.1:__PORT__"
     )
     Del-Key "$E\URLAllowlist"; Del-Key "$E\URLBlocklist"
@@ -300,7 +336,6 @@ if ($Mode -eq "Lock") {
     # lock screen rotation - a bumped tablet must not flip sideways
     Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AutoRotation" "Enable" 0
 
-    Restart-Explorer
     New-Item -Path $DoneLock -ItemType File -Force | Out-Null
     Log "applied"
 }
@@ -358,7 +393,7 @@ if ($Mode -eq "Unlock") {
     Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AutoRotation" "Enable" 1
 
     Remove-Item (Join-Path $Dir "lock.done") -Force
-    Restart-Explorer
+    Remove-Item (Join-Path $Dir "hive.sid")  -Force
     New-Item -Path $DoneUnlk -ItemType File -Force | Out-Null
     Log "reverted"
 }
