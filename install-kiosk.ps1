@@ -423,7 +423,7 @@ function Invoke-Lockdown {
                 'arcgis.com', 'arcgisonline.com', 'arcgis.net',
                 'vimeo.com', 'vimeocdn.com', 'sodir.no',
                 'sidagis.github.io', 'githubusercontent.com',
-                'fonts.googleapis.com', 'fonts.gstatic.com'))
+                'fonts.googleapis.com', 'fonts.gstatic.com')
     if ($url -and $url -match '^https?://([^/:]+)') {
         $h = $Matches[1]
         $parts = $h.Split('.')
