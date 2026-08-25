@@ -29,7 +29,7 @@ param(
     [string]$AppUrl,
     [int]$IdleSeconds = 0,
 
-    [ValidateSet('Install','Lockdown','Unlock','Verify')]
+    [ValidateSet('Install','Lockdown','Unlock','Verify','Tasks')]
     [string]$Mode = 'Install',
 
     # Lockdown only: also make the kiosk the Windows shell for this user,
@@ -419,13 +419,15 @@ function Invoke-Lockdown {
     # kiosk cannot browse anywhere else and the app still works.
     $ini = Join-Path $Dir 'kiosk.ini'
     $url = Get-IniValue $ini 'AppUrl'
-    $hosts = @('file:///' + $Dir.Replace('\','/').TrimEnd('/') + '/',
-               '[*.]arcgis.com', '[*.]arcgisonline.com', '[*.]arcgis.net',
-               '[*.]vimeo.com', '[*.]vimeocdn.com')
+    $hosts = @('file:///' + $Dir.Replace('\','/').TrimEnd('/') + '/',              
+                'arcgis.com', 'arcgisonline.com', 'arcgis.net',
+                'vimeo.com', 'vimeocdn.com', 'sodir.no',
+                'sidagis.github.io', 'githubusercontent.com',
+                'fonts.googleapis.com', 'fonts.gstatic.com'))
     if ($url -and $url -match '^https?://([^/:]+)') {
         $h = $Matches[1]
         $parts = $h.Split('.')
-        if ($parts.Count -ge 2) { $hosts += ('[*.]' + ($parts[-2..-1] -join '.')) }
+        if ($parts.Count -ge 2) { $hosts += ($parts[-2..-1] -join '.') }
         $hosts += $h
     }
     $key = 'HKLM\SOFTWARE\Policies\Microsoft\Edge\URLAllowlist'
@@ -609,6 +611,12 @@ switch ($Mode) {
     'Verify' {
         Invoke-Verify -Dir $InstallDir
     }
+
+    'Tasks' {
+        Step 'Re-registering the lockdown tasks'
+        Register-SessionTasks -Dir $InstallDir
+    }
+
 
     'Lockdown' {
         Invoke-Lockdown -Dir $InstallDir
